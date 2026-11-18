@@ -1,17 +1,16 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Activity, TrendingUp, TrendingDown, BarChart2, Shield, Zap, Flame,
-  Search, RefreshCw, Layers, Eye, Award, BookOpen, PlusCircle, Trash2,
-  CheckCircle2, AlertTriangle, Cpu, DollarSign, Target, ArrowUpRight,
-  ArrowDownRight, Clock, Filter, Sparkles, UserCheck, Lock, ChevronRight, Database
+  Activity, RefreshCw, BookOpen, PlusCircle, Trash2,
+  Target, ArrowUpRight, ArrowDownRight, Clock, Sparkles, Database, Key, Check
 } from 'lucide-react';
 
-// Supabase 環境變數讀取 (自動對接你的專案網址)
-const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL || 'https://julzibxroodjnoimskig.supabase.co').replace(/\/$/, '');
-const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+// ============================================================================
+// 已內建你的 Supabase 專屬網址與 Publishable 金鑰
+const SUPABASE_URL = 'https://julzibxroodjnoimskig.supabase.co';
+const HARDCODED_SUPABASE_KEY = 'sb_publishable_epsbUqYAz4_hiz-mRzqCvg_uwvV--iP';
 const OWNER_EMAIL = 'mahelun@gmail.com';
+// ============================================================================
 
-// 預設保底數據（當尚無雲端數據時顯示）
 const FALLBACK_MARKET = [
   { symbol: 'SPX', name: '標普 500 指數', price: 7340.53, change: -1.03, dailySignal: '空頭承壓', h4Signal: '回調轉弱', obos: -42, obosText: '輕度超賣 (Lv.2)' },
   { symbol: 'NDX', name: '納斯達克 100', price: 27001.79, change: -0.72, dailySignal: '空頭承壓', h4Signal: '區間盤整', obos: -28, obosText: '中性區間 (Lv.3)' },
@@ -24,7 +23,6 @@ const FALLBACK_MARKET = [
 const FALLBACK_GEX = {
   SPX: {
     spot: 7340.53, callWall: 7700, putWall: 7000, gammaFlip: 7542.5, netGex: -77.85,
-    pcRatio: 1.18, ivRank: 64,
     strikes: [
       { strike: 7000, callGex: 0.5, putGex: -18.4 },
       { strike: 7100, callGex: 0.8, putGex: -12.2 },
@@ -45,8 +43,45 @@ const INITIAL_BLOGGER_CONSENSUS = [
   { ticker: 'PLTR', name: 'Palantir Tech', bullCount: 7, bearCount: 3, sector: 'AI 企業軟體', keyTheme: '商業與國防訂單雙高增，但 OBOS 處於 Lv.4 輕度超買' },
 ];
 
+// 兼容新版 sb_publishable_ 與傳統 JWT 金鑰的請求封裝
+async function supabaseRequest(path, activeKey, options = {}) {
+  const isJwt = activeKey.startsWith('eyJ');
+  const baseHeaders = {
+    apikey: activeKey,
+    ...(isJwt ? { Authorization: `Bearer ${activeKey}` } : {}),
+    ...(options.headers || {})
+  };
+
+  let resp = await fetch(`${SUPABASE_URL}${path}`, {
+    ...options,
+    headers: baseHeaders
+  });
+
+  // 若閘道器要求同時帶上 Authorization 標頭則自動重試
+  if (resp.status === 401 && !isJwt) {
+    resp = await fetch(`${SUPABASE_URL}${path}`, {
+      ...options,
+      headers: {
+        ...baseHeaders,
+        Authorization: `Bearer ${activeKey}`
+      }
+    });
+  }
+  return resp;
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [apiKey, setApiKey] = useState(() => {
+    return (
+      HARDCODED_SUPABASE_KEY.trim() ||
+      localStorage.getItem('MAC_SUPABASE_KEY') ||
+      import.meta.env.VITE_SUPABASE_ANON_KEY ||
+      ''
+    ).trim();
+  });
+  const [keyInput, setKeyInput] = useState('');
+  const [showKeyBox, setShowKeyBox] = useState(false);
+
   const [marketData, setMarketData] = useState(FALLBACK_MARKET);
   const [gexMap, setGexMap] = useState(FALLBACK_GEX);
   const [unusualFlows, setUnusualFlows] = useState([]);
@@ -56,37 +91,33 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [dbConnected, setDbConnected] = useState(false);
 
-  // 博主報告與 AI 提煉狀態
   const [bloggerConsensus, setBloggerConsensus] = useState(INITIAL_BLOGGER_CONSENSUS);
   const [reportSession, setReportSession] = useState('盤前簡報');
   const [reportSummary, setReportSummary] = useState('今日焦點：VIX 波動率走高，SPX 處於 Gamma Flip 7542.5 下方的負 Gamma 區間（Net GEX -77.85B），日內波動幅度放大，建議嚴守 Put Wall 7000 與 Call Wall 7700 關鍵支撐阻力。');
   const [rawBloggerInput, setRawBloggerInput] = useState('');
   const [isAiExtracting, setIsAiExtracting] = useState(false);
 
-  // 個人雲端持倉狀態
   const [positions, setPositions] = useState([]);
   const [newPos, setNewPos] = useState({ ticker: '', direction: 'LONG', entry: '', target: '', stop: '', notes: '' });
   const [isSavingPos, setIsSavingPos] = useState(false);
 
-  // 從 Supabase 讀取所有真實資料表
-  const fetchAllSupabaseData = useCallback(async () => {
-    setIsRefreshing(true);
-    if (!SUPABASE_KEY) {
-      setIsRefreshing(false);
-      setLastUpdated(new Date().toLocaleTimeString() + ' (未配置 KEY)');
+  const fetchAllSupabaseData = useCallback(async (overrideKey) => {
+    const activeKey = (overrideKey !== undefined ? overrideKey : apiKey).trim();
+    if (!activeKey) {
+      setDbConnected(false);
+      setLastUpdated('請於上方貼上金鑰');
       return;
     }
 
-    const headers = {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json'
-    };
+    setIsRefreshing(true);
 
     try {
+      let connected = false;
+
       // 1. 讀取 market_signals
-      const rMarket = await fetch(`${SUPABASE_URL}/rest/v1/market_signals?select=*`, { headers });
+      const rMarket = await supabaseRequest('/rest/v1/market_signals?select=*', activeKey);
       if (rMarket.ok) {
+        connected = true;
         const mRows = await rMarket.json();
         if (Array.isArray(mRows) && mRows.length > 0) {
           const order = ['SPX', 'NDX', 'SOX', 'VIX', 'DXY', 'US10Y'];
@@ -103,13 +134,13 @@ export default function App() {
             }))
             .sort((a, b) => order.indexOf(a.symbol) - order.indexOf(b.symbol));
           setMarketData(mapped);
-          setDbConnected(true);
         }
       }
 
       // 2. 讀取 options_gex
-      const rGex = await fetch(`${SUPABASE_URL}/rest/v1/options_gex?select=*`, { headers });
+      const rGex = await supabaseRequest('/rest/v1/options_gex?select=*', activeKey);
       if (rGex.ok) {
+        connected = true;
         const gRows = await rGex.json();
         if (Array.isArray(gRows) && gRows.length > 0) {
           const newGexMap = {};
@@ -136,12 +167,11 @@ export default function App() {
           });
           setGexMap(newGexMap);
           setUnusualFlows(allFlows);
-          setDbConnected(true);
         }
       }
 
-      // 3. 讀取 portfolio_positions (個人雲端持倉)
-      const rPos = await fetch(`${SUPABASE_URL}/rest/v1/portfolio_positions?select=*&order=created_at.desc`, { headers });
+      // 3. 讀取 portfolio_positions
+      const rPos = await supabaseRequest('/rest/v1/portfolio_positions?select=*&order=created_at.desc', activeKey);
       if (rPos.ok) {
         const pRows = await rPos.json();
         if (Array.isArray(pRows)) {
@@ -157,8 +187,8 @@ export default function App() {
         }
       }
 
-      // 4. 讀取 daily_reports (最新一筆 AI 報告)
-      const rRep = await fetch(`${SUPABASE_URL}/rest/v1/daily_reports?select=*&order=created_at.desc&limit=1`, { headers });
+      // 4. 讀取 daily_reports
+      const rRep = await supabaseRequest('/rest/v1/daily_reports?select=*&order=created_at.desc&limit=1', activeKey);
       if (rRep.ok) {
         const repRows = await rRep.json();
         if (Array.isArray(repRows) && repRows.length > 0) {
@@ -171,21 +201,37 @@ export default function App() {
         }
       }
 
-      setLastUpdated(new Date().toLocaleTimeString('zh-HK', { hour12: false }));
+      setDbConnected(connected);
+      setLastUpdated(
+        connected
+          ? new Date().toLocaleTimeString('zh-HK', { hour12: false })
+          : '連線失敗，請檢查資料庫權限'
+      );
     } catch (err) {
       console.error('Supabase fetch error:', err);
+      setDbConnected(false);
     } finally {
       setIsRefreshing(false);
     }
-  }, []);
+  }, [apiKey]);
 
   useEffect(() => {
     fetchAllSupabaseData();
-    const timer = setInterval(fetchAllSupabaseData, 60000); // 每分鐘自動同步一次
+    const timer = setInterval(() => fetchAllSupabaseData(), 60000);
     return () => clearInterval(timer);
   }, [fetchAllSupabaseData]);
 
-  // 新增持倉並寫入 Supabase portfolio_positions 表
+  const handleSaveKeyOnWeb = (e) => {
+    e.preventDefault();
+    const cleaned = keyInput.trim();
+    if (!cleaned) return;
+    localStorage.setItem('MAC_SUPABASE_KEY', cleaned);
+    setApiKey(cleaned);
+    setKeyInput('');
+    setShowKeyBox(false);
+    fetchAllSupabaseData(cleaned);
+  };
+
   const handleAddPosition = async (e) => {
     e.preventDefault();
     if (!newPos.ticker || !newPos.entry) return;
@@ -202,12 +248,10 @@ export default function App() {
     };
 
     try {
-      if (SUPABASE_KEY) {
-        const resp = await fetch(`${SUPABASE_URL}/rest/v1/portfolio_positions`, {
+      if (apiKey) {
+        const resp = await supabaseRequest('/rest/v1/portfolio_positions', apiKey, {
           method: 'POST',
           headers: {
-            apikey: SUPABASE_KEY,
-            Authorization: `Bearer ${SUPABASE_KEY}`,
             'Content-Type': 'application/json',
             Prefer: 'return=representation'
           },
@@ -225,15 +269,10 @@ export default function App() {
     }
   };
 
-  // 刪除持倉並同步從 Supabase 移除
   const handleDeletePosition = async (id) => {
-    if (SUPABASE_KEY) {
-      await fetch(`${SUPABASE_URL}/rest/v1/portfolio_positions?id=eq.${id}`, {
-        method: 'DELETE',
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`
-        }
+    if (apiKey) {
+      await supabaseRequest(`/rest/v1/portfolio_positions?id=eq.${id}`, apiKey, {
+        method: 'DELETE'
       });
       await fetchAllSupabaseData();
     } else {
@@ -241,12 +280,10 @@ export default function App() {
     }
   };
 
-  // 儲存每日簡報與博主觀點至 Supabase daily_reports 表
   const handleSaveReportToCloud = async () => {
     if (!rawBloggerInput.trim()) return;
     setIsAiExtracting(true);
 
-    // 解析輸入文字中的股票代碼 (例如 NVDA, TSLA, SOXL, SPX, QQQ, AMD, PLTR)
     const matchedTickers = rawBloggerInput.toUpperCase().match(/\b[A-Z]{2,5}\b/g) || ['NVDA'];
     const primaryTicker = matchedTickers[0];
     const isBear = /看空|做空|下跌|破位|回調|PUT|BEAR/i.test(rawBloggerInput);
@@ -266,12 +303,10 @@ export default function App() {
     setBloggerConsensus(updatedConsensus);
     setReportSummary(rawBloggerInput);
 
-    if (SUPABASE_KEY) {
-      await fetch(`${SUPABASE_URL}/rest/v1/daily_reports`, {
+    if (apiKey) {
+      await supabaseRequest('/rest/v1/daily_reports', apiKey, {
         method: 'POST',
         headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -320,14 +355,17 @@ export default function App() {
                 <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
                   MACHELEN.BIZ
                 </span>
-                <span className={`text-[11px] px-2 py-0.5 rounded border flex items-center gap-1 ${
-                  dbConnected
-                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                    : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                }`}>
+                <button
+                  onClick={() => setShowKeyBox(!showKeyBox)}
+                  className={`text-[11px] px-2.5 py-0.5 rounded border flex items-center gap-1 cursor-pointer transition ${
+                    dbConnected
+                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
+                      : 'bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500/30'
+                  }`}
+                >
                   <Database className="w-3 h-3" />
-                  {dbConnected ? 'Supabase 實時連線' : '等待環境變數'}
-                </span>
+                  {dbConnected ? 'Supabase 實時連線' : '點此檢查金鑰'}
+                </button>
               </div>
               <p className="text-xs text-slate-400">
                 美股期權 GEX · Gamma Flip 關鍵點位 · OBOS 五級指標 · 雲端實盤追蹤
@@ -341,7 +379,7 @@ export default function App() {
               <span>更新: {lastUpdated}</span>
             </div>
             <button
-              onClick={fetchAllSupabaseData}
+              onClick={() => fetchAllSupabaseData()}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 text-xs font-medium transition"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
@@ -349,6 +387,31 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {showKeyBox && (
+          <div className="max-w-7xl mx-auto mt-3 pt-3 border-t border-slate-800/80">
+            <form onSubmit={handleSaveKeyOnWeb} className="flex flex-col sm:flex-row items-center gap-2 bg-slate-900/95 p-2.5 rounded-xl border border-amber-500/40">
+              <div className="flex items-center gap-2 text-xs text-amber-300 shrink-0 px-1">
+                <Key className="w-4 h-4" />
+                <span>更換 Supabase 金鑰：</span>
+              </div>
+              <input
+                type="text"
+                value={keyInput}
+                onChange={(e) => setKeyInput(e.target.value)}
+                placeholder="貼上新的 Supabase key..."
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-emerald-400"
+              />
+              <button
+                type="submit"
+                className="w-full sm:w-auto shrink-0 px-4 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-1 transition"
+              >
+                <Check className="w-4 h-4" />
+                儲存並連線
+              </button>
+            </form>
+          </div>
+        )}
       </header>
 
       <main className="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-8">
@@ -447,7 +510,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* GEX 關鍵點位卡片 */}
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-3.5">
               <span className="text-xs text-slate-400">標的現價 ({selectedGexTicker})</span>
@@ -473,7 +535,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* GEX 雙向柱狀圖 + 期權異動大單 */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
             <div className="lg:col-span-6 bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
@@ -516,7 +577,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* 期權異動大單表 */}
             <div className="lg:col-span-6 bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-bold text-white">CBOE 實時期權異動大單 (Vol / OI 放大)</h3>
@@ -568,7 +628,7 @@ export default function App() {
                     ) : (
                       <tr>
                         <td colSpan="6" className="py-8 text-center text-slate-500">
-                          目前盤中異動大單載入中，點選上方「立即同步雲端」刷新
+                          目前無符合條件的異動大單，點選上方「立即同步雲端」刷新
                         </td>
                       </tr>
                     )}
@@ -579,7 +639,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* 3. 每日盤前盤後報告與博主觀點 (寫入 daily_reports 表) */}
+        {/* 3. 每日盤前盤後報告與博主觀點 */}
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-4">
           <div className="lg:col-span-7 bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
@@ -617,7 +677,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* 新增簡報並同步寫入 daily_reports */}
           <div className="lg:col-span-5 bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-3">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-amber-400" />
@@ -653,7 +712,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* 4. 個人實盤 / 試錯池持倉管理 (寫入 portfolio_positions 表) */}
+        {/* 4. 個人實盤 / 試錯池持倉管理 */}
         <section className="bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-bold text-white flex items-center gap-2">
