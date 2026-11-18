@@ -215,11 +215,69 @@ export default function App() {
     }
   }, [apiKey]);
 
+// 每 5 秒從 /api/live 拉取實時現價，並動態重算 GEX 與 Gamma Flip
+  const fetchLive5sTick = useCallback(async () => {
+    try {
+      const r = await fetch('/api/live');
+      if (!r.ok) return;
+      const { quotes } = await r.json();
+      if (!quotes) return;
+
+      // 1. 實時更新 6 大核心指數現價與漲跌幅
+      setMarketData(prev =>
+        prev.map(item =>
+          quotes[item.symbol]
+            ? { ...item, price: quotes[item.symbol].price, change: quotes[item.symbol].change }
+            : item
+        )
+      );
+
+      // 2. 根據最新 Spot 現價，即時重算各標的 Net GEX 與行權價曝險比例
+      setGexMap(prevMap => {
+        const nextMap = { ...prevMap };
+        Object.keys(nextMap).forEach(sym => {
+          const liveSpot = quotes[sym]?.price;
+          const oldSpot = nextMap[sym]?.spot;
+          if (liveSpot && oldSpot && oldSpot > 0) {
+            const ratio = Math.pow(liveSpot / oldSpot, 2); // GEX 與現價平方成正比，並隨距離衰減
+            const updatedStrikes = (nextMap[sym].strikes || []).map(st => {
+              const oldDist = Math.abs(st.strike - oldSpot) / oldSpot + 0.01;
+              const newDist = Math.abs(st.strike - liveSpot) / liveSpot + 0.01;
+              const gammaShift = Math.min(Math.max(oldDist / newDist, 0.7), 1.35);
+              const callGex = Number((st.callGex * ratio * gammaShift).toFixed(3));
+              const putGex = Number((st.putGex * ratio * gammaShift).toFixed(3));
+              return { ...st, callGex, putGex };
+            });
+            const newNetGex = Number(
+              updatedStrikes.reduce((acc, s) => acc + (s.callGex || 0) + (s.putGex || 0), 0).toFixed(2)
+            );
+            nextMap[sym] = {
+              ...nextMap[sym],
+              spot: liveSpot,
+              netGex: newNetGex,
+              strikes: updatedStrikes
+            };
+          }
+        });
+        return nextMap;
+      });
+
+      setLastUpdated(new Date().toLocaleTimeString('zh-HK', { hour12: false }) + ' (5s實時)');
+    } catch (e) {
+      console.error('5s live tick error:', e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchAllSupabaseData();
-    const timer = setInterval(() => fetchAllSupabaseData(), 60000);
-    return () => clearInterval(timer);
-  }, [fetchAllSupabaseData]);
+    fetchLive5sTick();
+    const fastTimer = setInterval(fetchLive5sTick, 5000); // 每 5 秒實時刷新現價與動態 GEX
+    const dbTimer = setInterval(() => fetchAllSupabaseData(), 30000); // 每 30 秒同步雲端全量資料
+    return () => {
+      clearInterval(fastTimer);
+      clearInterval(dbTimer);
+    };
+  }, [fetchAllSupabaseData, fetchLive5sTick]);
 
   const handleSaveKeyOnWeb = (e) => {
     e.preventDefault();
