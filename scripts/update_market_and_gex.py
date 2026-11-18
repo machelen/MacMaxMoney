@@ -12,7 +12,7 @@ from scipy.stats import norm
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://julzibxroodjnoimskig.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()  # 選填：支援 Groq (gsk_...) 或 OpenRouter (sk-or-...)
+AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -25,7 +25,7 @@ YF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-MARKET_INDEXES = [
+DEFAULT_MARKET_INDEXES = [
     {"symbol": "SPX", "yf_ticker": "%5EGSPC", "name": "標普 500 指數"},
     {"symbol": "NDX", "yf_ticker": "%5ENDX", "name": "納斯達克 100"},
     {"symbol": "SOX", "yf_ticker": "%5ESOX", "name": "費城半導體指數"},
@@ -34,7 +34,7 @@ MARKET_INDEXES = [
     {"symbol": "US10Y", "yf_ticker": "%5ETNX", "name": "10年期美債收益率"},
 ]
 
-GEX_TICKERS = [
+DEFAULT_GEX_TICKERS = [
     {"symbol": "SPX", "cboe_ticker": "_SPX"},
     {"symbol": "QQQ", "cboe_ticker": "QQQ"},
     {"symbol": "IWM", "cboe_ticker": "IWM"},
@@ -42,7 +42,11 @@ GEX_TICKERS = [
     {"symbol": "NVDA", "cboe_ticker": "NVDA"},
 ]
 
-FOCUS_STOCKS = [
+INDEX_YF_MAP = {item["symbol"]: item["yf_ticker"] for item in DEFAULT_MARKET_INDEXES}
+INDEX_CBOE_MAP = {"SPX": "_SPX", "NDX": "_NDX", "VIX": "_VIX", "RUT": "_RUT"}
+NO_OPTION_SYMBOLS = {"DXY", "US10Y", "SOX"}
+
+DEFAULT_FOCUS_STOCKS = [
     {"ticker": "NVDA", "name": "NVIDIA Corp.", "sector": "AI 算力晶片"},
     {"ticker": "SOXL", "name": "3倍做多半導體 ETF", "sector": "槓桿 ETF"},
     {"ticker": "TSLA", "name": "Tesla Inc.", "sector": "自駕與機器人"},
@@ -51,8 +55,20 @@ FOCUS_STOCKS = [
     {"ticker": "AVGO", "name": "Broadcom Inc.", "sector": "ASIC 與網通"},
 ]
 
+def fmt_signed(n):
+    return f"+{n}" if n > 0 else f"{n}"
+
+def fetch_custom_watchlist_from_db():
+    """從 Supabase 讀取用戶在網頁端新增的所有自選觀察標的"""
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/market_signals?select=symbol,name", headers=HEADERS, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[Watchlist Read Warning] {e}")
+    return []
+
 def translate_to_zh_hk(text):
-    """免 API Key 自動將英文外電標題翻譯為繁體中文"""
     if not text:
         return ""
     try:
@@ -66,7 +82,7 @@ def translate_to_zh_hk(text):
         pass
     return text
 
-def fetch_yf_chart(ticker_encoded, interval="1d", range_str="6mo"):
+def fetch_yf_ohlcv(ticker_encoded, interval="1d", range_str="1y"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval={interval}&range={range_str}"
     resp = requests.get(url, headers=YF_HEADERS, timeout=15)
     if resp.status_code != 200:
@@ -75,86 +91,140 @@ def fetch_yf_chart(ticker_encoded, interval="1d", range_str="6mo"):
     data = resp.json()
     result = data.get("chart", {}).get("result", [])
     if not result:
-        return pd.Series(dtype=float)
-    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-    return pd.Series(closes, dtype=float).dropna()
+        return pd.DataFrame(), {}
+    meta = result[0].get("meta", {})
+    quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+    df = pd.DataFrame({
+        "open": quote.get("open", []),
+        "high": quote.get("high", []),
+        "low": quote.get("low", []),
+        "close": quote.get("close", []),
+        "volume": [v if v is not None else 0 for v in quote.get("volume", [])]
+    }).dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    return df, meta
 
-def calc_rsi(series, period=14):
-    if len(series) < period + 1:
-        return 50.0
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=period).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=period).mean()
-    rs = gain / loss.replace(0, np.nan)
+def calc_wilder_rsi_series(close_s, period=14):
+    delta = close_s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    val = float(rsi.iloc[-1])
-    return 50.0 if math.isnan(val) else val
+    return rsi.fillna(50.0)
 
-def calc_obos_and_signals(idx):
+def calc_mfi_series(df, period=14):
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    tp_diff = tp.diff()
+    rmf = tp * df["volume"]
+    pos_mf = pd.Series(np.where(tp_diff > 0, rmf, 0.0)).rolling(period).sum()
+    neg_mf = pd.Series(np.where(tp_diff < 0, rmf, 0.0)).rolling(period).sum()
+    vol_sum = df["volume"].rolling(period).sum()
+    mfr = pos_mf / neg_mf.replace(0, np.nan)
+    mfi = 100 - (100 / (1 + mfr))
+    mfi = mfi.fillna(50.0)
+    return pd.Series(np.where(vol_sum == 0, np.nan, mfi))
+
+def calc_atr_series(df, period=14):
+    prev_c = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_c).abs(),
+        (df["low"] - prev_c).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().bfill().fillna(1.0)
+
+def calc_obos_v2_and_signals(idx):
     try:
-        close = fetch_yf_chart(idx["yf_ticker"], interval="1d", range_str="6mo")
-        close_1h = fetch_yf_chart(idx["yf_ticker"], interval="60m", range_str="1mo")
-        if close.empty or len(close) < 22:
+        df, meta = fetch_yf_ohlcv(idx["yf_ticker"], interval="1d", range_str="1y")
+        df_1h, _ = fetch_yf_ohlcv(idx["yf_ticker"], interval="60m", range_str="1mo")
+        if df.empty or len(df) < 25:
             return None
 
+        close = df["close"]
         price = float(close.iloc[-1])
         prev_close = float(close.iloc[-2])
         change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
         ema20_d = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
         ema50_d = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema200_d = float(close.ewm(span=min(200, len(close)), adjust=False).mean().iloc[-1])
+        is_bull = price >= ema200_d
+
         if price > ema20_d and ema20_d > ema50_d:
-            daily_signal = "多頭趨勢"
+            trend_tag = "多頭趨勢"
         elif price < ema20_d and ema20_d < ema50_d:
-            daily_signal = "空頭承壓"
+            trend_tag = "空頭承壓"
         elif price > ema20_d:
-            daily_signal = "反彈修復"
+            trend_tag = "反彈修復"
         else:
-            daily_signal = "高位震盪"
+            trend_tag = "震盪整理"
 
-        if not close_1h.empty and len(close_1h) >= 40:
-            close_4h = close_1h.iloc[::4]
+        daily_signal = f"{'牛市(>EMA200)' if is_bull else '熊市(<EMA200)'}·{trend_tag}"
+
+        if not df_1h.empty and len(df_1h) >= 40:
+            close_4h = df_1h["close"].iloc[::4].reset_index(drop=True)
             ema20_4h = float(close_4h.ewm(span=20, adjust=False).mean().iloc[-1])
-            rsi_4h = calc_rsi(close_4h, 14)
+            rsi_4h = float(calc_wilder_rsi_series(close_4h, 14).iloc[-1])
             if price > ema20_4h and rsi_4h > 55:
-                h4_signal = "多頭共振"
+                h4_signal = "4H多頭共振"
             elif price < ema20_4h and rsi_4h < 45:
-                h4_signal = "回調轉弱"
+                h4_signal = "4H回調轉弱"
             else:
-                h4_signal = "區間盤整"
+                h4_signal = "4H區間盤整"
         else:
-            h4_signal = daily_signal
+            h4_signal = trend_tag
 
-        rsi_d = calc_rsi(close, 14)
-        ma20 = float(close.rolling(20).mean().iloc[-1])
-        std20 = float(close.rolling(20).std().iloc[-1])
-        if math.isnan(std20) or std20 <= 0:
-            std20 = 1.0
-        z_score = (price - ma20) / std20
+        # OBOS v2.0 序列運算
+        w_rsi = calc_wilder_rsi_series(close, 14)
+        mfi_s = calc_mfi_series(df, 14).fillna(w_rsi)
+        atr_s = calc_atr_series(df, 14).replace(0, 1.0)
+        ma20_s = close.rolling(20).mean().bfill()
+        std20_s = close.rolling(20).std().replace(0, 1.0).bfill().fillna(1.0)
 
-        rsi_component = (rsi_d - 50.0) * 1.2
-        bb_component = float(np.clip(z_score * 20.0, -50.0, 50.0))
-        obos_score = int(np.clip(round(rsi_component + bb_component), -100, 100))
+        z_s = (close - ma20_s) / std20_s
+        damper_s = (std20_s / (1.5 * atr_s)).clip(0.5, 1.0)
+        mom_v2 = (0.6 * w_rsi + 0.4 * mfi_s - 50.0) * 1.2
+        bb_v2 = (z_s * 20.0).clip(-50.0, 50.0) * damper_s
+        obos_series = (mom_v2 + bb_v2).fillna(0.0).round().clip(-100, 100)
 
-        if obos_score >= 75:
-            obos_level = "極度超買 (Lv.5)"
-        elif obos_score >= 35:
-            obos_level = "輕度超買 (Lv.4)"
-        elif obos_score <= -75:
-            obos_level = "極度超賣 (Lv.1)"
-        elif obos_score <= -35:
-            obos_level = "輕度超賣 (Lv.2)"
+        obos_prev = int(obos_series.iloc[-2])
+        obos_now = int(obos_series.iloc[-1])
+
+        os_thresh = -60 if is_bull else -85
+        ob_thresh = 85 if is_bull else 60
+        last_open = float(df["open"].iloc[-1])
+
+        # 六色閉環實戰燈號判定（含右側買賣點、動能減速止盈、破底失效止損、極值觀察）
+        if obos_prev <= os_thresh and obos_now > obos_prev and price >= last_open:
+            obos_level = f"🟢 右側買點觸發 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
+        elif obos_prev >= ob_thresh and obos_now < obos_prev and price <= last_open:
+            obos_level = f"🔴 右側賣點觸發 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
+        elif 45 <= obos_prev < ob_thresh and (obos_prev - obos_now) >= 12 and price < last_open:
+            obos_level = f"🟣 動能減速止盈 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
+        elif obos_now <= -40 and (obos_now - obos_prev) <= -10 and price < ema20_d and price < last_open:
+            obos_level = f"🚨 破底失效止損 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
+        elif obos_now <= os_thresh:
+            obos_level = f"🟡 超賣觀察中 (門檻{os_thresh})"
+        elif obos_now >= ob_thresh:
+            obos_level = f"🟠 超買觀察中 (門檻+{ob_thresh})"
+        elif obos_now >= 35:
+            obos_level = f"偏強推進 (止盈警戒+45/+{ob_thresh})"
+        elif obos_now <= -35:
+            obos_level = f"偏弱整理 (買點門檻{os_thresh})"
         else:
-            obos_level = "中性區間 (Lv.3)"
+            obos_level = f"中性區間 (門檻{os_thresh}/+{ob_thresh})"
+
+        resolved_name = idx.get("name") or meta.get("shortName") or idx["symbol"]
 
         return {
             "symbol": idx["symbol"],
-            "name": idx["name"],
+            "name": resolved_name,
             "price": round(price, 2),
             "change_pct": change_pct,
             "daily_signal": daily_signal,
             "h4_signal": h4_signal,
-            "obos_score": obos_score,
+            "obos_score": obos_now,
             "obos_level": obos_level,
             "updated_at": datetime.datetime.utcnow().isoformat()
         }
@@ -173,6 +243,8 @@ def bs_gamma(S, K, T, r, sigma):
 
 def calc_gex_for_ticker(item):
     symbol = item["symbol"]
+    if symbol in NO_OPTION_SYMBOLS:
+        return None
     cboe_ticker = item["cboe_ticker"]
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_ticker}.json"
     strike_map = {}
@@ -235,12 +307,8 @@ def calc_gex_for_ticker(item):
                     "exp": exp_str,
                     "strike": round(strike, 1),
                     "type": "CALL" if opt_type == "C" else "PUT",
-                    "structure": "異常掃單 (Sweep)" if (vol / oi) >= 3.0 else "大單建倉 (Block)",
-                    "size": f"{int(vol)} 張",
                     "volOiRatio": f"{round(vol / oi, 1)}x",
                     "premium": f"${round(premium / 1e6, 2)}M" if premium >= 1e6 else f"${int(premium / 1e3)}K",
-                    "iv": f"{round(iv * 100, 1)}%",
-                    "sentiment": "BULLISH" if opt_type == "C" else "BEARISH",
                     "_raw_prem": premium
                 })
 
@@ -297,9 +365,11 @@ def calc_gex_for_ticker(item):
         print(f"[GEX Error] {symbol}: {e}")
         return None
 
-def fetch_live_market_news():
+def fetch_live_market_news(extra_tickers):
+    base_syms = ["SPY", "QQQ", "NVDA", "TSLA", "SOXL", "AMD", "PLTR", "AVGO"] + extra_tickers
+    sym_query = ",".join(list(dict.fromkeys(base_syms))[:15])
     rss_urls = [
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY,QQQ,NVDA,TSLA,SOXL,AMD,PLTR,AVGO&region=US&lang=en-US",
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym_query}&region=US&lang=en-US",
         "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
     ]
     headlines = []
@@ -312,42 +382,16 @@ def fetch_live_market_news():
                     title = item.findtext("title")
                     if title and title not in headlines:
                         headlines.append(title.strip())
-        except Exception as e:
-            print(f"[RSS Warning] {e}")
-    return headlines[:15]
-
-def fetch_focus_stocks_metrics():
-    snapshots = []
-    for item in FOCUS_STOCKS:
-        tk = item["ticker"]
-        s = fetch_yf_chart(tk, interval="1d", range_str="3mo")
-        if s.empty or len(s) < 20:
-            continue
-        price = round(float(s.iloc[-1]), 2)
-        prev = float(s.iloc[-2])
-        chg = round(((price - prev) / prev) * 100, 2) if prev else 0.0
-        ema20 = round(float(s.ewm(span=20, adjust=False).mean().iloc[-1]), 2)
-        rsi = round(calc_rsi(s, 14), 1)
-        snapshots.append({
-            "ticker": tk,
-            "name": item["name"],
-            "sector": item["sector"],
-            "price": price,
-            "change_pct": chg,
-            "ema20": ema20,
-            "rsi": rsi
-        })
-    return snapshots
+        except Exception:
+            pass
+    return headlines[:16]
 
 def call_free_ai_llm(prompt):
-    """優先調用 GitHub Actions 內建免費 GPT-4o-mini (免註冊)，或 Groq / OpenRouter"""
     endpoints = []
-
     if AI_API_KEY.startswith("gsk_"):
-        endpoints.append(("Groq Llama-3.3-70B", "https://api.groq.com/openai/v1/chat/completions", AI_API_KEY, "llama-3.3-70b-versatile"))
+        endpoints.append(("Groq", "https://api.groq.com/openai/v1/chat/completions", AI_API_KEY, "llama-3.3-70b-versatile"))
     elif AI_API_KEY.startswith("sk-"):
         endpoints.append(("OpenRouter", "https://openrouter.ai/api/v1/chat/completions", AI_API_KEY, "openai/gpt-4o-mini"))
-
     if GITHUB_TOKEN:
         endpoints.append(("GitHub Models (Azure)", "https://models.inference.ai.azure.com/chat/completions", GITHUB_TOKEN, "gpt-4o-mini"))
         endpoints.append(("GitHub Models", "https://models.github.ai/inference/chat/completions", GITHUB_TOKEN, "openai/gpt-4o-mini"))
@@ -356,14 +400,11 @@ def call_free_ai_llm(prompt):
         try:
             resp = requests.post(
                 url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 json={
                     "model": model_name,
                     "messages": [
-                        {"role": "system", "content": "你是一位專業的美股量化與期權策略師，請嚴格輸出純 JSON 格式（不要包含 ```json 標記）。"},
+                        {"role": "system", "content": "你是一位美股量化與期權策略師，請嚴格輸出純 JSON 格式（不含 Markdown 符號）。"},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.3
@@ -378,49 +419,38 @@ def call_free_ai_llm(prompt):
                 if parsed.get("summary") and parsed.get("tickers_consensus"):
                     print(f"✅ 成功透過 {label} 生成今日 AI 市場報告！")
                     return parsed
-            else:
-                print(f"[{label} 狀態碼 {resp.status_code}]: {resp.text[:160]}")
-        except Exception as e:
-            print(f"[{label} 略過]: {e}")
+        except Exception:
+            pass
     return None
 
-def generate_ai_daily_report(market_rows, gex_rows, stock_snapshots, headlines):
+def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
     utc_hour = datetime.datetime.utcnow().hour
-    if utc_hour < 13:
-        session_type = "盤前簡報"
-    elif utc_hour < 20:
-        session_type = "盤中快訊"
-    else:
-        session_type = "盤後總結"
-
+    session_type = "盤前簡報" if utc_hour < 13 else ("盤中快訊" if utc_hour < 20 else "盤後總結")
     hk_time_str = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M HKT")
 
     prompt = f"""
-請根據以下【{hk_time_str} 實時抓取的美股大盤數據、期權 GEX 點位、焦點個股技術面與最新華爾街新聞】，生成一份繁體中文的每日市場簡報與多空共識榜。
+請根據以下【{hk_time_str} 實時抓取的大盤與自選股 OBOS v2.0 六色燈號數據、期權 GEX 點位與最新外電新聞】，生成繁體中文每日市場簡報與多空共識榜（務必涵蓋用戶自選觀察標的）。
 
-【1. 大盤與宏觀實時數據】
+【1. 大盤與自選標的 OBOS v2.0 數據】
 {json.dumps(market_rows, ensure_ascii=False)}
 
-【2. 期權 GEX 與 Gamma Flip 核心點位】
-{json.dumps([{k: v for k, v in r.items() if k not in ['strikes_data']} for r in gex_rows], ensure_ascii=False)}
+【2. 期權 GEX 核心點位】
+{json.dumps([{k: v for k, v in r.items() if k != 'strikes_data'} for r in gex_rows], ensure_ascii=False)}
 
-【3. 焦點個股實時技術指標】
-{json.dumps(stock_snapshots, ensure_ascii=False)}
-
-【4. 最新華爾街實時新聞標題】
+【3. 最新華爾街實時新聞】
 {json.dumps(headlines, ensure_ascii=False)}
 
-請輸出以下 JSON 結構：
+請輸出純 JSON：
 {{
-  "summary": "300字內的繁體中文深度市場綜述：包含今日外電新聞焦點、SPX/NDX/SOX 趨勢與 OBOS 超買超賣解讀、SPX 與 QQQ 的 Call Wall/Put Wall/Gamma Flip 實戰點位應對策略。",
+  "summary": "300字內的繁體中文市場綜述：含外電焦點、SPX/NDX/SOX 的 EMA200 牛熊政權與 OBOS v2.0 進出場信號、以及 SPX/QQQ 的 Call/Put Wall 與 Gamma Flip 止盈止損應對策略。",
   "tickers_consensus": [
     {{
-      "ticker": "股票代碼 (NVDA, SOXL, TSLA, AMD, PLTR, AVGO)",
-      "name": "公司名稱與現價 (如 NVIDIA Corp. $162.7)",
-      "bullCount": 整數 (1~15),
-      "bearCount": 整數 (1~15),
-      "sector": "板塊名稱",
-      "keyTheme": "70字內的繁體中文最新催化劑、新聞重點與關鍵支撐阻力位（如 EMA20 或 Call/Put Wall）"
+      "ticker": "代碼",
+      "name": "名稱與現價",
+      "bullCount": 1到15整數,
+      "bearCount": 1到15整數,
+      "sector": "板塊或自選追蹤",
+      "keyTheme": "70字內的繁體中文新聞催化劑、OBOS v2.0 六色燈號狀態與期權關鍵支撐阻力位"
     }}
   ]
 }}
@@ -433,109 +463,89 @@ def generate_ai_daily_report(market_rows, gex_rows, stock_snapshots, headlines):
             "tickers_consensus": ai_res["tickers_consensus"]
         }
 
-    # 雙保險：自動將最新英文外電翻譯為繁體中文 + 量化點位合成研報
-    zh_headlines = [translate_to_zh_hk(h) for h in headlines[:4]]
-    top_news_zh = "；".join(zh_headlines[:3]) if zh_headlines else "市場聚焦美債收益率與半導體板塊資金輪動"
-
+    zh_headlines = [translate_to_zh_hk(h) for h in headlines[:3]]
+    top_news_zh = "；".join(zh_headlines) if zh_headlines else "市場聚焦美債收益率與科技股資金輪動"
     spx_m = next((m for m in market_rows if m["symbol"] == "SPX"), {})
-    ndx_m = next((m for m in market_rows if m["symbol"] == "NDX"), {})
-    sox_m = next((m for m in market_rows if m["symbol"] == "SOX"), {})
-    vix_m = next((m for m in market_rows if m["symbol"] == "VIX"), {})
     spx_g = next((g for g in gex_rows if g["symbol"] == "SPX"), {})
-    qqq_g = next((g for g in gex_rows if g["symbol"] == "QQQ"), {})
-
-    gamma_regime = "正 Gamma 緩衝區（逢低買盤支撐強）" if spx_g.get("net_gex", 0) >= 0 else "負 Gamma 加速區（日內波動放大、切忌追高殺跌）"
 
     summary_text = (
-        f"【{hk_time_str} 實時量化與外電早報】大盤監控：SPX 報 {spx_m.get('price', '--')} ({spx_m.get('change_pct', 0)}%，{spx_m.get('daily_signal', '')} / OBOS {spx_m.get('obos_score', 0)})，"
-        f"NDX 報 {ndx_m.get('price', '--')} ({ndx_m.get('change_pct', 0)}%)，費半 SOX 報 {sox_m.get('price', '--')} ({sox_m.get('change_pct', 0)}%)，VIX 波動率 {vix_m.get('price', '--')}。"
-        f"期權結構方面，SPX 處於 {gamma_regime}（Net GEX {spx_g.get('net_gex', 0)}B），上檔 Call Wall 阻力 {spx_g.get('call_wall', '--')}、下檔 Put Wall 支撐 {spx_g.get('put_wall', '--')}、多空翻轉點 Gamma Flip 位於 {spx_g.get('gamma_flip', '--')}；"
-        f"QQQ 核心支撐阻力區間為 {qqq_g.get('put_wall', '--')} 至 {qqq_g.get('call_wall', '--')}。"
-        f"最新外電焦點：{top_news_zh}。"
+        f"【{hk_time_str} OBOS v2.0 實時研報】SPX 報 {spx_m.get('price', '--')} ({spx_m.get('change_pct', 0)}%，{spx_m.get('daily_signal', '')}，{spx_m.get('obos_level', '')})。"
+        f"SPX 期權 Call Wall {spx_g.get('call_wall', '--')} / Put Wall {spx_g.get('put_wall', '--')} / Gamma Flip {spx_g.get('gamma_flip', '--')} (Net GEX {spx_g.get('net_gex', 0)}B)。"
+        f"外電焦點：{top_news_zh}。"
     )
 
-    consensus_list = []
     gex_lookup = {g["symbol"]: g for g in gex_rows}
-    for st in stock_snapshots:
-        tk = st["ticker"]
-        chg = st["change_pct"]
-        rsi = st["rsi"]
-        price = st["price"]
-        ema20 = st["ema20"]
-
-        bull = max(2, min(13, 8 + (3 if chg > 0 else -2) + (2 if price > ema20 else -2)))
-        bear = 15 - bull
-
-        raw_tk_news = next((h for h in headlines if tk in h.upper()), "")
-        zh_tk_news = translate_to_zh_hk(raw_tk_news) if raw_tk_news else ""
-
+    consensus_list = []
+    for row in focus_rows[:10]:
+        tk = row["symbol"]
+        bull = max(2, min(13, 8 + (3 if row["change_pct"] >= 0 else -2) + (2 if "牛市" in row["daily_signal"] else -2)))
         g_info = gex_lookup.get(tk)
-        if g_info:
-            level_str = f"期權 Call Wall ${g_info['call_wall']} / Put Wall ${g_info['put_wall']} / Flip ${g_info['gamma_flip']}"
-        else:
-            level_str = f"20日均線關鍵位 ${ema20}，日線 RSI({rsi})"
-
-        theme = f"現價 ${price} ({'+' if chg >= 0 else ''}{chg}%)，{level_str}。"
-        if zh_tk_news:
-            theme += f" 最新外電：{zh_tk_news[:65]}"
-
+        g_txt = f"Call Wall ${g_info['call_wall']} / Put Wall ${g_info['put_wall']}" if g_info else row["daily_signal"]
         consensus_list.append({
             "ticker": tk,
-            "name": f"{st['name']} (${price})",
+            "name": f"{row['name']} (${row['price']})",
             "bullCount": bull,
-            "bearCount": bear,
-            "sector": st["sector"],
-            "keyTheme": theme
+            "bearCount": 15 - bull,
+            "sector": "自選與核心追蹤",
+            "keyTheme": f"{row['obos_level']} · {g_txt}"
         })
 
-    return {
-        "session_type": session_type,
-        "summary": summary_text,
-        "tickers_consensus": consensus_list
-    }
+    return {"session_type": session_type, "summary": summary_text, "tickers_consensus": consensus_list}
 
 def main():
-    print("1. 正在更新大盤行情與 OBOS 五級信號...")
+    existing_db_rows = fetch_custom_watchlist_from_db()
+    default_syms = {m["symbol"] for m in DEFAULT_MARKET_INDEXES}
+    custom_items = []
+    for r in existing_db_rows:
+        sym = (r.get("symbol") or "").strip().upper()
+        if sym and sym not in default_syms:
+            yf_sym = INDEX_YF_MAP.get(sym, urllib.parse.quote(sym.replace(".", "-")))
+            custom_items.append({"symbol": sym, "yf_ticker": yf_sym, "name": r.get("name") or sym})
+
+    all_market_targets = DEFAULT_MARKET_INDEXES + custom_items
+    print(f"1. 正在更新 {len(all_market_targets)} 個大盤與自選標的 OBOS v2.0 六色信號...")
     market_rows = []
-    for idx in MARKET_INDEXES:
-        res = calc_obos_and_signals(idx)
+    for idx in all_market_targets:
+        res = calc_obos_v2_and_signals(idx)
         if res:
             market_rows.append(res)
 
     if market_rows:
-        r1 = requests.post(
-            f"{SUPABASE_URL}/rest/v1/market_signals?on_conflict=symbol",
-            headers=HEADERS,
-            data=json.dumps(market_rows)
-        )
+        r1 = requests.post(f"{SUPABASE_URL}/rest/v1/market_signals?on_conflict=symbol", headers=HEADERS, data=json.dumps(market_rows))
         print(f"market_signals 寫入狀態: {r1.status_code}")
 
-    print("2. 正在計算期權 GEX、Gamma Flip 與異動大單...")
+    default_gex_syms = {g["symbol"] for g in DEFAULT_GEX_TICKERS}
+    extra_gex_targets = [
+        {"symbol": c["symbol"], "cboe_ticker": INDEX_CBOE_MAP.get(c["symbol"], c["symbol"].replace("-", ""))}
+        for c in custom_items if c["symbol"] not in default_gex_syms and c["symbol"] not in NO_OPTION_SYMBOLS
+    ]
+    all_gex_targets = DEFAULT_GEX_TICKERS + extra_gex_targets
+
+    print(f"2. 正在計算 {len(all_gex_targets)} 個標的期權 GEX 與 Gamma Flip...")
     gex_rows = []
-    for item in GEX_TICKERS:
+    for item in all_gex_targets:
         gex_res = calc_gex_for_ticker(item)
         if gex_res:
             gex_rows.append(gex_res)
 
     if gex_rows:
-        r2 = requests.post(
-            f"{SUPABASE_URL}/rest/v1/options_gex?on_conflict=symbol",
-            headers=HEADERS,
-            data=json.dumps(gex_rows)
-        )
+        r2 = requests.post(f"{SUPABASE_URL}/rest/v1/options_gex?on_conflict=symbol", headers=HEADERS, data=json.dumps(gex_rows))
         print(f"options_gex 寫入狀態: {r2.status_code}")
 
-    print("3. 正在透過 GitHub 內建免費 AI 生成繁體中文每日簡報...")
-    headlines = fetch_live_market_news()
-    stock_snapshots = fetch_focus_stocks_metrics()
-    report_payload = generate_ai_daily_report(market_rows, gex_rows, stock_snapshots, headlines)
+    print("3. 正在生成包含自選標的之每日 AI 簡報...")
+    custom_syms_only = [c["symbol"] for c in custom_items]
+    headlines = fetch_live_market_news(custom_syms_only)
 
+    focus_rows = [m for m in market_rows if m["symbol"] not in default_syms]
+    for f_def in DEFAULT_FOCUS_STOCKS:
+        if not any(x["symbol"] == f_def["ticker"] for x in focus_rows):
+            res_f = calc_obos_v2_and_signals({"symbol": f_def["ticker"], "yf_ticker": f_def["ticker"], "name": f_def["name"]})
+            if res_f:
+                focus_rows.append(res_f)
+
+    report_payload = generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines)
     if report_payload:
-        r3 = requests.post(
-            f"{SUPABASE_URL}/rest/v1/daily_reports",
-            headers=HEADERS,
-            data=json.dumps(report_payload)
-        )
+        r3 = requests.post(f"{SUPABASE_URL}/rest/v1/daily_reports", headers=HEADERS, data=json.dumps(report_payload))
         print(f"daily_reports 寫入狀態: {r3.status_code}")
 
 if __name__ == "__main__":
