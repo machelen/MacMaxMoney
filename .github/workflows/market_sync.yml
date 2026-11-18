@@ -1,0 +1,30 @@
+name: MacMaxMoney Market & GEX Sync
+
+on:
+  schedule:
+    # 美股盤前、盤中與盤後每 15 分鐘自動執行一次 (週一至週五 UTC 12:00 - 21:45)
+    - cron: '*/15 12-21 * * 1-5'
+  workflow_dispatch: # 支援在 GitHub 網頁上一鍵手動觸發測試
+
+jobs:
+  sync-market-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas numpy scipy requests
+
+      - name: Run Market & GEX Calculator
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python scripts/update_market_and_gex.py
