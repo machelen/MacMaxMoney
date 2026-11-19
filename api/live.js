@@ -15,30 +15,12 @@ const INDEX_CBOE_MAP = {
   RUT: '_RUT'
 };
 
-const ALLOWED_INDEX_ROOTS = {
-  SPX: new Set(['SPX', 'SPXW']),
-  NDX: new Set(['NDX', 'NDXP']),
-  RUT: new Set(['RUT', 'RUTW']),
-  VIX: new Set(['VIX', 'VIXW'])
-};
-
-const AM_SETTLED_INDEX_ROOTS = new Set(['SPX', 'NDX', 'RUT']);
 const NO_OPTION_SYMBOLS = new Set(['DXY', 'US10Y', 'SOX']);
-
-// 2026-2027 美股 NYSE / CBOE 休市日曆
-const US_MARKET_HOLIDAYS = new Set([
-  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
-  '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
-  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
-  '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24'
-]);
+const OCC_REGEX = /^([A-Z]+)(\d{6})([CP])(\d{8})$/;
 
 const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 };
-
-const OCC_REGEX = /^([A-Z]+)(\d{6})([CP])(\d{8})$/;
-const RISK_FREE_RATE = 0.042;
 
 const SPAM_REGEX = /fool\.com|investorplace|insidermonkey|gobankingrates|247wallst|zacks\.com|marketbeat|simplywall\.st|warren buffett|millionaire|if you invested|unstoppable stock|stocks? to buy|prediction:|stock market crash|forget |here's why|motley fool|retirees?|social security|cathie wood|no-brainer|screaming buy|\b[1-9] stocks?\b/i;
 
@@ -58,69 +40,54 @@ const COMPANY_KEYWORD_MAP = {
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const fmtSigned = (n) => (n > 0 ? `+${n}` : `${n}`);
 
-// 取得精確美東時間 (America/New_York，自動轉換夏令 EDT / 冬令 EST)
-function getEtClock(dateObj = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-US', {
+// 取得美東 (America/New_York) 精確時鐘與場次切換狀態
+function getNySessionClock(nowMs = Date.now()) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false
-  }).formatToParts(dateObj);
+  });
+  const parts = Object.fromEntries(dtf.formatToParts(new Date(nowMs)).map(p => [p.type, p.value]));
+  const year = Number(parts.year);
+  const month = Number(parts.month);
+  const day = Number(parts.day);
+  const hour = Number(parts.hour) % 24;
+  const minute = Number(parts.minute);
+  const second = Number(parts.second);
 
-  const map = {};
-  for (const p of parts) map[p.type] = p.value;
-  const hour = Number(map.hour) === 24 ? 0 : Number(map.hour);
-  const minute = Number(map.minute);
-  const ymd = `${map.year}-${map.month}-${map.day}`;
-  const dow = new Date(`${ymd}T12:00:00Z`).getUTCDay();
-  return { ymd, hour, minute, dow };
+  const todayStr = `${parts.year}-${parts.month}-${parts.day}`;
+  const nextDayUtc = new Date(Date.UTC(year, month - 1, day) + 86400000);
+  const tomorrowStr = nextDayUtc.toISOString().slice(0, 10);
+
+  const asUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const nyOffsetMs = asUtcMs - nowMs;
+  const mins = hour * 60 + minute;
+
+  return {
+    todayStr,
+    // 16:00 ET 收盤後，當日 0DTE 已結算失效，自動推進至下一場次
+    minSessionDate: mins >= 16 * 60 ? tomorrowStr : todayStr,
+    afterOpen: mins >= 9 * 60 + 30,
+    nyOffsetMs,
+    nowMs
+  };
 }
 
-// 計算「當前／下一個美股正規交易時段 (Market Session)」美東日期
-function getTargetSessionET(now = new Date()) {
-  const et = getEtClock(now);
-  const isTradingDay = (ymd, dow) => dow !== 0 && dow !== 6 && !US_MARKET_HOLIDAYS.has(ymd);
-  const beforeClose = et.hour < 16 || (et.hour === 16 && et.minute < 5);
-
-  if (isTradingDay(et.ymd, et.dow) && beforeClose) {
-    return { targetYmd: et.ymd, etNow: et };
-  }
-
-  let cursorMs = Date.parse(`${et.ymd}T12:00:00Z`);
-  for (let i = 0; i < 10; i++) {
-    cursorMs += 86400000;
-    const d = new Date(cursorMs);
-    const candYmd = d.toISOString().slice(0, 10);
-    const candDow = d.getUTCDay();
-    if (isTradingDay(candYmd, candDow)) {
-      return { targetYmd: candYmd, etNow: et };
-    }
-  }
-  return { targetYmd: et.ymd, etNow: et };
-}
-
-// 精確計算距離目標到期日美東結算時刻的剩餘年化日曆時間 T (與 CBOE IV 年化基準一致)
-function getExactYearsToExpiry(expStr, settleHourET = 16, settleMinET = 0) {
-  // 先以 20:00Z 探測該日美東是否為夏令時 (EDT=16時, EST=15時)
-  const probeUtc = Date.parse(`${expStr}T20:00:00Z`);
-  const probeEt = getEtClock(new Date(probeUtc));
-  const utcOffsetHours = 20 - probeEt.hour; // EDT 為 4, EST 為 5
-  const settleUtcMs = Date.parse(`${expStr}T00:00:00Z`) + (settleHourET + utcOffsetHours) * 3600000 + settleMinET * 60000;
-  const hoursLeft = (settleUtcMs - Date.now()) / 3600000;
-  // 保留 1.5 小時下限，避免收盤最後一刻 sqrt(T) 趨近 0 導致數值發散
-  return Math.max(hoursLeft, 1.5) / (365 * 24);
+// 計算距離目標到期日美東 16:00 收盤的精確年化時間 T (設 2 小時下限防止到期瞬間發散)
+function calcYearsToExpiry(expStr, nyClock) {
+  const [ey, em, ed] = expStr.split('-').map(Number);
+  const expCloseUtcMs = Date.UTC(ey, em - 1, ed, 16, 0, 0) - nyClock.nyOffsetMs;
+  const hoursLeft = Math.max(2.0, (expCloseUtcMs - nyClock.nowMs) / 3600000);
+  return hoursLeft / (365 * 24);
 }
 
 function bsGamma(S, K, T, r, sigma) {
-  if (!(S > 0 && K > 0 && T > 0 && sigma > 0)) return 0;
-  const volSqrtT = sigma * Math.sqrt(T);
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / volSqrtT;
+  if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
   const pdf = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
-  return pdf / (S * volSqrtT);
+  return pdf / (S * sigma * sqrtT);
 }
 
 function decodeXmlText(str = '') {
@@ -159,49 +126,39 @@ async function translateEnToZh(text) {
 function classifyNewsItem(title, desc, watchSet) {
   const combined = `${title} ${desc}`;
   const lower = combined.toLowerCase();
-
   let category = 'SECTOR';
   let score = 2;
 
   if (/\b(fed|fomc|powell|cpi|pce|ppi|payroll|nonfarm|jobless|inflation|treasury|yield|tariff|trump|china|trade war|export|rate cut|rate hike|gdp)\b/i.test(combined)) {
-    category = 'MACRO';
-    score += 5;
+    category = 'MACRO'; score += 5;
   } else if (/\b(earnings|eps|revenue|guidance|forecast|q[1-4]|quarter|beats|misses|profit|margin|buyback|dividend|deliveries)\b/i.test(combined)) {
-    category = 'EARNINGS';
-    score += 5;
+    category = 'EARNINGS'; score += 5;
   } else if (/\b(upgrade[sd]?|downgrade[sd]?|price target|overweight|underweight|outperform|initiates|bofa|goldman|morgan stanley|jpmorgan|citi|wedbush|barclays|bernstein|ubs)\b/i.test(combined)) {
-    category = 'RATING';
-    score += 4;
+    category = 'RATING'; score += 4;
   }
 
   let impact = 'WATCH';
   if (/\b(beat[s]?|surge[sd]?|jump[sd]?|rall(y|ies)|upgrade[sd]?|raises? (guidance|target|forecast)|record|approval|wins?|deal|buyback)\b/i.test(combined)) {
-    impact = 'BULLISH';
-    score += 2;
+    impact = 'BULLISH'; score += 2;
   } else if (/\b(miss(es)?|cut[s]?|slash(es)?|downgrade[sd]?|plunge[sd]?|drop[s]?|tumble[sd]?|fall[s]?|probe|lawsuit|subpoena|tariff|curb|ban|delay|recall|warn[s]?)\b/i.test(combined)) {
-    impact = 'BEARISH';
-    score += 2;
+    impact = 'BEARISH'; score += 2;
   } else if (category === 'MACRO' || /\b(fed|cpi|pce|powell|fomc|volatility|standoff|options)\b/i.test(combined)) {
-    impact = 'VOLATILE';
-    score += 2;
+    impact = 'VOLATILE'; score += 2;
   }
 
   const matched = new Set();
-  const upperWords = combined.match(/\b[A-Z]{2,5}\b/g) || [];
-  upperWords.forEach(w => {
+  (combined.match(/\b[A-Z]{2,5}\b/g) || []).forEach(w => {
     if (watchSet.has(w) || KNOWN_TICKERS.includes(w)) matched.add(w);
   });
   Object.entries(COMPANY_KEYWORD_MAP).forEach(([kw, tk]) => {
     if (lower.includes(kw)) matched.add(tk);
   });
   if (/\b(semiconductor|chip|ai server|gpu|blackwell|foundry)\b/i.test(combined) && matched.size === 0) {
-    matched.add('NVDA');
-    matched.add('SOXL');
+    matched.add('NVDA'); matched.add('SOXL');
   }
 
   const tickers = Array.from(matched).slice(0, 4);
   if (tickers.some(t => watchSet.has(t))) score += 3;
-
   return { category, impact, tickers: tickers.length ? tickers : ['MACRO'], score };
 }
 
@@ -234,13 +191,11 @@ async function fetchActionableIntel(watchSymbols) {
           const link = decodeXmlText((block.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1] || '');
           const desc = decodeXmlText((block.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '');
           const pubStr = decodeXmlText((block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i) || [])[1] || '');
-          if (!title || title.length < 18) continue;
-          if (SPAM_REGEX.test(title) || SPAM_REGEX.test(link)) continue;
+          if (!title || title.length < 18 || SPAM_REGEX.test(title) || SPAM_REGEX.test(link)) continue;
 
           const pubMs = Date.parse(pubStr) || Date.now();
           const ageHours = Math.max(0, (Date.now() - pubMs) / 3600000);
           if (ageHours > 48) continue;
-
           rawItems.push({ source: f.source, title, link, desc: desc.slice(0, 180), pubMs, ageHours });
         }
       } catch {
@@ -255,7 +210,6 @@ async function fetchActionableIntel(watchSymbols) {
     const normKey = it.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 42);
     if (seenKeys.has(normKey)) continue;
     seenKeys.add(normKey);
-
     const meta = classifyNewsItem(it.title, it.desc, watchSet);
     const recencyBonus = it.ageHours <= 3 ? 4 : (it.ageHours <= 10 ? 2 : 0);
     scored.push({ ...it, ...meta, totalScore: meta.score + recencyBonus });
@@ -264,26 +218,18 @@ async function fetchActionableIntel(watchSymbols) {
   scored.sort((a, b) => b.totalScore - a.totalScore || b.pubMs - a.pubMs);
   const topNews = scored.slice(0, 8);
 
-  const buildTakeawayEn = (it) => {
-    if (it.desc && it.desc.length > 25 && it.desc.toLowerCase() !== it.title.toLowerCase()) {
-      return it.desc.length > 150 ? `${it.desc.slice(0, 147)}...` : it.desc;
-    }
-    if (it.category === 'MACRO') return 'Monitor US10Y yields, VIX, and SPX next-session Gamma Flip reaction for intraday direction.';
-    if (it.category === 'EARNINGS') return `Watch ${it.tickers.join('/')} post-earnings volume expansion and next-session Call/Put Wall defense.`;
-    if (it.category === 'RATING') return `Institutional rating catalyst on ${it.tickers.join('/')}; confirm entry with EMA5 & OBOS hook.`;
-    return `Key catalyst for ${it.tickers.join('/')}; avoid chasing extended moves inside negative GEX.`;
-  };
-
   const enriched = await Promise.all(
     topNews.map(async (it) => {
-      const takeawayEn = buildTakeawayEn(it);
-      const [titleZh, takeawayZh] = await Promise.all([
-        translateEnToZh(it.title),
-        translateEnToZh(takeawayEn)
-      ]);
+      let takeawayEn = '';
+      if (it.desc && it.desc.length > 25 && it.desc.toLowerCase() !== it.title.toLowerCase()) {
+        takeawayEn = it.desc.length > 150 ? `${it.desc.slice(0, 147)}...` : it.desc;
+      } else if (it.category === 'MACRO') {
+        takeawayEn = 'Monitor US10Y yields, VIX, and next-session SPX Gamma Flip reaction for intraday direction.';
+      } else {
+        takeawayEn = `Key catalyst for ${it.tickers.join('/')}; confirm entries with EMA5 & next-session Call/Put Walls.`;
+      }
+      const [titleZh, takeawayZh] = await Promise.all([translateEnToZh(it.title), translateEnToZh(takeawayEn)]);
       const mins = Math.max(1, Math.round((Date.now() - it.pubMs) / 60000));
-      const timeAgo = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
-
       return {
         kind: 'intel_v2',
         id: `news_${it.pubMs}_${it.tickers[0]}`,
@@ -291,7 +237,7 @@ async function fetchActionableIntel(watchSymbols) {
         impact: it.impact,
         tickers: it.tickers,
         source: it.source,
-        timeAgo,
+        timeAgo: mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`,
         url: it.link,
         title_en: it.title,
         title_zh: titleZh,
@@ -483,14 +429,14 @@ function computeObosV2(symbol, resDaily, resHourly) {
   };
 }
 
-// 機構級單一交易時段 (Next Market Session) GEX 與全鏈 BS 零點插值引擎
+// 精準計算「下一個 / 當前有效 Market Session 單一到期日」之 CBOE GEX 與 BS 求根 Gamma Flip
 async function computeCboeGex(symbol) {
   if (NO_OPTION_SYMBOLS.has(symbol)) return null;
-  const cleanSym = symbol.replace(/[^A-Z]/g, '');
-  const cboeSym = INDEX_CBOE_MAP[symbol] || cleanSym;
-  const allowedRoots = ALLOWED_INDEX_ROOTS[symbol] || new Set([cleanSym]);
-  const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSym}.json`;
+  const cboeSym = INDEX_CBOE_MAP[symbol] || symbol.replace(/[^A-Z0-9]/g, '');
+  const cleanBaseRoot = symbol.replace(/[^A-Z]/g, '');
+  const validRoots = new Set([cleanBaseRoot, `${cleanBaseRoot}W`, `${cleanBaseRoot}P`]);
 
+  const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSym}.json`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 6500);
 
@@ -501,219 +447,189 @@ async function computeCboeGex(symbol) {
     const json = await r.json();
     const data = json?.data || {};
     const spot = Number(data.current_price || 0);
-    const rawOptions = data.options || [];
-    if (spot <= 0 || !rawOptions.length) return null;
+    const options = data.options || [];
+    if (spot <= 0 || !options.length) return null;
 
-    const { targetYmd, etNow } = getTargetSessionET();
-    const parsedContracts = [];
+    const nyClock = getNySessionClock();
+    const parsedAll = [];
     const unusualList = [];
 
-    // 第一輪：嚴格 OCC 根代碼驗證 + 剔除已過期或當日已結算之 AM 指數合約
-    for (const opt of rawOptions) {
+    for (const opt of options) {
       const m = OCC_REGEX.exec(opt.option || '');
-      if (!m) continue;
+      if (!m) continue; // 自動過濾 TSLA1 等拆股非標準交割合約
       const [, root, ymd, optType, strikeRaw] = m;
-      if (!allowedRoots.has(root)) continue;
+      if (!validRoots.has(root)) continue;
 
       const expStr = `20${ymd.slice(0, 2)}-${ymd.slice(2, 4)}-${ymd.slice(4, 6)}`;
-      if (expStr < targetYmd) continue;
-
-      // 若為當日到期之 AM 結算指數合約 (SPX/NDX/RUT)，美東 09:30 開盤結算後即剔除
-      const isAmRoot = AM_SETTLED_INDEX_ROOTS.has(root);
-      if (isAmRoot && expStr === etNow.ymd && (etNow.hour > 9 || (etNow.hour === 9 && etNow.minute >= 30))) {
-        continue;
-      }
+      if (expStr < nyClock.minSessionDate) continue;
 
       const strike = parseInt(strikeRaw, 10) / 1000;
       const oi = Number(opt.open_interest || 0);
       const vol = Number(opt.volume || 0);
-      const iv = Number(opt.iv || 0);
+      const rawIv = Number(opt.iv || 0);
+      const iv = rawIv > 5 ? rawIv / 100 : rawIv;
       const cboeGamma = Number(opt.gamma || 0);
-      const lastP = Number(opt.last_trade_price || opt.ask || 0);
+      const lastP = Number(opt.last_trade_price || opt.bid || opt.ask || 0);
 
-      // 掃描未過期異常期權大單 (保留 45 天內機構大額權利金異動)
-      const daysDiff = (Date.parse(`${expStr}T16:00:00Z`) - Date.parse(`${targetYmd}T16:00:00Z`)) / 86400000;
-      if (daysDiff <= 45 && vol >= 300 && oi > 0 && vol / oi >= 1.4) {
-        const premium = vol * lastP * 100;
-        if (premium >= 100000) {
-          unusualList.push({
-            time: new Date().toISOString().slice(11, 16),
-            ticker: symbol,
-            exp: expStr,
-            strike: Number(strike.toFixed(1)),
-            type: optType === 'C' ? 'CALL' : 'PUT',
-            volOiRatio: `${(vol / oi).toFixed(1)}x`,
-            premium: premium >= 1e6 ? `$${(premium / 1e6).toFixed(2)}M` : `$${Math.round(premium / 1e3)}K`,
-            _raw: premium
-          });
-        }
-      }
+      parsedAll.push({ root, expStr, optType, strike, oi, vol, iv, cboeGamma });
 
-      if (Math.abs(strike - spot) / spot > 0.25) continue;
-      parsedContracts.push({ root, isAmRoot, expStr, optType, strike, oi, iv, cboeGamma });
-    }
-
-    if (!parsedContracts.length) return null;
-
-    // 鎖定覆蓋「下一個交易時段」的唯一最近到期日 (SPX/QQQ/IWM 為下一場單日，個股為最近週五)
-    const activeExpiries = [...new Set(parsedContracts.filter(c => c.oi > 0).map(c => c.expStr))].sort();
-    if (!activeExpiries.length) return null;
-    const targetExpiry = activeExpiries[0];
-
-    const sessionContracts = parsedContracts.filter(c => c.expStr === targetExpiry && c.oi > 0);
-    if (!sessionContracts.length) return null;
-
-    // 提取 ATM 中位數 IV，僅供極少數近價平但未回傳 IV 之有效合約兜底（絕不對遠價外死單塞假 IV）
-    const atmIvs = sessionContracts
-      .filter(c => Math.abs(c.strike - spot) / spot <= 0.02 && c.iv > 0.01 && c.iv < 4.0)
-      .map(c => c.iv)
-      .sort((a, b) => a - b);
-    const fallbackAtmIv = atmIvs.length ? atmIvs[Math.floor(atmIvs.length / 2)] : 0.20;
-
-    const tPm = getExactYearsToExpiry(targetExpiry, 16, 0);
-    const tAm = getExactYearsToExpiry(targetExpiry, 9, 30);
-
-    const strikeMap = {};
-    const validForFlipScan = [];
-
-    for (const c of sessionContracts) {
-      const T = c.isAmRoot ? tAm : tPm;
-      let effIv = (c.iv > 0.005 && c.iv < 5.0) ? c.iv : 0;
-      if (effIv === 0 && c.cboeGamma > 0 && Math.abs(c.strike - spot) / spot <= 0.03) {
-        effIv = fallbackAtmIv;
-      }
-
-      // 現價 GEX：優先採用 CBOE 官方計算之 Gamma；若無且有真實 IV 則用 BS 計算；兩者皆 0 則為死單歸零
-      let gammaAtSpot = c.cboeGamma > 0 ? c.cboeGamma : (effIv > 0 ? bsGamma(spot, c.strike, T, RISK_FREE_RATE, effIv) : 0);
-      if (gammaAtSpot <= 0 && effIv <= 0) continue;
-
-      const gexVal = (gammaAtSpot * c.oi * 100 * spot * spot * 0.01) / 1e9;
-
-      if (!strikeMap[c.strike]) {
-        strikeMap[c.strike] = {
-          callGex: 0, putGex: 0, callOi: 0, putOi: 0,
-          callIvWeighted: 0, putIvWeighted: 0, T
-        };
-      }
-      const bucket = strikeMap[c.strike];
-      if (c.optType === 'C') {
-        bucket.callGex += gexVal;
-        bucket.callOi += c.oi;
-        bucket.callIvWeighted += (effIv || fallbackAtmIv) * c.oi;
-      } else {
-        bucket.putGex -= gexVal;
-        bucket.putOi += c.oi;
-        bucket.putIvWeighted += (effIv || fallbackAtmIv) * c.oi;
-      }
-
-      if (effIv > 0) {
-        validForFlipScan.push({
-          strike: c.strike,
-          sign: c.optType === 'C' ? 1 : -1,
-          oi: c.oi,
-          iv: effIv,
-          T
+      // 異動大單掃描：鎖定近期有效合約 (未來 14 天內且未過期)
+      const premium = vol * lastP * 100;
+      const daysDiff = (Date.parse(expStr) - Date.parse(nyClock.minSessionDate)) / 86400000;
+      if (daysDiff <= 14 && Math.abs(strike - spot) / spot <= 0.15 && vol >= 300 && oi > 0 && vol / oi >= 1.4 && premium >= 100000) {
+        unusualList.push({
+          time: new Date().toISOString().slice(11, 16),
+          ticker: symbol,
+          exp: expStr,
+          strike: Number(strike.toFixed(1)),
+          type: optType === 'C' ? 'CALL' : 'PUT',
+          volOiRatio: `${(vol / oi).toFixed(1)}x`,
+          premium: premium >= 1e6 ? `$${(premium / 1e6).toFixed(2)}M` : `$${Math.round(premium / 1e3)}K`,
+          _raw: premium
         });
       }
     }
 
-    const allStrikes = Object.keys(strikeMap).map(Number).sort((a, b) => a - b);
-    if (!allStrikes.length) return null;
+    const activeWithOi = parsedAll.filter(c => c.oi > 0);
+    if (!activeWithOi.length) return null;
 
-    // 1. Call Wall 與 Put Wall：直接取該交易時段全鏈最大正 Call GEX 與最大負 Put GEX
-    const callWall = allStrikes.reduce((best, k) => (strikeMap[k].callGex > strikeMap[best].callGex ? k : best), allStrikes[0]);
-    const putWall = allStrikes.reduce((best, k) => (strikeMap[k].putGex < strikeMap[best].putGex ? k : best), allStrikes[0]);
-    const netGex = allStrikes.reduce((acc, k) => acc + strikeMap[k].callGex + strikeMap[k].putGex, 0);
+    // 鎖定單一最近有效場次到期日 (Next / Active Market Session Expiry)
+    const uniqueExps = [...new Set(activeWithOi.map(c => c.expStr))].sort();
+    const targetExp = uniqueExps[0];
+    let sessionChain = activeWithOi.filter(c => c.expStr === targetExp && Math.abs(c.strike - spot) / spot <= 0.25);
 
-    // 2. Gamma Flip：全鏈 -25% ~ +25% 模擬價格 Black-Scholes 重定價，線性插值求 Total Net GEX(S*) = 0
-    let gammaFlip = Number(spot.toFixed(1));
-    if (validForFlipScan.length > 0) {
-      const crossings = [];
-      let prevS = null;
-      let prevNet = null;
-      let minAbsNet = Infinity;
-      let minAbsPrice = spot;
-
-      for (let step = -100; step <= 100; step++) {
-        const pct = step * 0.0025; // 0.25% 步長，共 201 個模擬價格點
-        const candS = spot * (1 + pct);
-        const s2Factor = candS * candS * 0.01 * 100 / 1e9;
-        let simNet = 0;
-
-        for (let i = 0; i < validForFlipScan.length; i++) {
-          const item = validForFlipScan[i];
-          const g = bsGamma(candS, item.strike, item.T, RISK_FREE_RATE, item.iv);
-          simNet += item.sign * g * item.oi * s2Factor;
-        }
-
-        if (Math.abs(simNet) < minAbsNet) {
-          minAbsNet = Math.abs(simNet);
-          minAbsPrice = candS;
-        }
-
-        if (prevNet !== null && ((prevNet <= 0 && simNet >= 0) || (prevNet >= 0 && simNet <= 0)) && prevNet !== simNet) {
-          const zeroS = prevS + (candS - prevS) * (0 - prevNet) / (simNet - prevNet);
-          crossings.push(zeroS);
-        }
-        prevS = candS;
-        prevNet = simNet;
+    // 若當日為月結算週五且已過 09:30 ET 開盤，剔除已結算的指數 AM 合約 (保留 SPXW/NDXP/RUTW)
+    if (targetExp === nyClock.todayStr && nyClock.afterOpen) {
+      const hasPmWeekly = sessionChain.some(c => c.root.endsWith('W') || c.root.endsWith('P'));
+      if (hasPmWeekly) {
+        sessionChain = sessionChain.filter(c => c.root.endsWith('W') || c.root.endsWith('P'));
       }
+    }
+    if (!sessionChain.length) return null;
 
-      if (crossings.length > 0) {
-        // 若存在多個零點，取距離當前現價最近之多空翻轉點
-        crossings.sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot));
-        gammaFlip = Number(crossings[0].toFixed(1));
+    // 計算該場次平價 ATM 中位數 IV，供無報價行權價備援
+    const nearAtmIvs = sessionChain
+      .filter(c => c.iv > 0.01 && c.iv < 4.0 && Math.abs(c.strike - spot) / spot <= 0.04)
+      .map(c => c.iv)
+      .sort((a, b) => a - b);
+    const atmIv = nearAtmIvs.length ? nearAtmIvs[Math.floor(nearAtmIvs.length / 2)] : 0.20;
+    const T = calcYearsToExpiry(targetExp, nyClock);
+    const R_RATE = 0.043;
+
+    const strikeMap = {};
+    const repricingBook = [];
+
+    for (const c of sessionChain) {
+      const sigma = (c.iv > 0.01 && c.iv < 4.0) ? c.iv : atmIv;
+      // 現價 GEX 優先採用 CBOE 官方模型 Gamma；缺失時以精確 T 與真實 IV 代入 BS 公式
+      const gammaNow = c.cboeGamma > 0 ? c.cboeGamma : bsGamma(spot, c.strike, T, R_RATE, sigma);
+      const gexVal = (gammaNow * c.oi * 100 * spot * spot * 0.01) / 1e9;
+
+      if (!strikeMap[c.strike]) {
+        strikeMap[c.strike] = { callGex: 0, putGex: 0, callOi: 0, putOi: 0, callIvSum: 0, putIvSum: 0 };
+      }
+      if (c.optType === 'C') {
+        strikeMap[c.strike].callGex += gexVal;
+        strikeMap[c.strike].callOi += c.oi;
+        strikeMap[c.strike].callIvSum += sigma * c.oi;
       } else {
-        gammaFlip = Number(minAbsPrice.toFixed(1));
+        strikeMap[c.strike].putGex -= gexVal;
+        strikeMap[c.strike].putOi += c.oi;
+        strikeMap[c.strike].putIvSum += sigma * c.oi;
+      }
+
+      repricingBook.push({ strike: c.strike, oi: c.oi, sigma, isCall: c.optType === 'C' });
+    }
+
+    const allStrikes = Object.keys(strikeMap).map(Number).sort((a, b) => a - b);
+    const liquidStrikes = allStrikes.filter(k => Math.abs(k - spot) / spot <= 0.15);
+    const wallPool = liquidStrikes.length ? liquidStrikes : allStrikes;
+
+    // 不設人為現價遮罩，直接取單場次最大 Call GEX 與最大負 Put GEX
+    const callWall = wallPool.reduce((a, b) => (strikeMap[b].callGex > strikeMap[a].callGex ? b : a));
+    const putWall = wallPool.reduce((a, b) => (strikeMap[b].putGex < strikeMap[a].putGex ? b : a));
+    const totalNetGex = allStrikes.reduce((acc, k) => acc + strikeMap[k].callGex + strikeMap[k].putGex, 0);
+
+    // 機構級 Gamma Flip：以 Black-Scholes 全鏈重定價掃描 + 二分法求解 NetGEX(S*) = 0
+    const netGexAtHypSpot = (hypS) => {
+      let total = 0;
+      const scale = (100 * hypS * hypS * 0.01) / 1e9;
+      for (const item of repricingBook) {
+        const g = bsGamma(hypS, item.strike, T, R_RATE, item.sigma);
+        const val = g * item.oi * scale;
+        total += item.isCall ? val : -val;
+      }
+      return total;
+    };
+
+    const STEPS = 80;
+    const minS = spot * 0.88;
+    const maxS = spot * 1.12;
+    const stepS = (maxS - minS) / STEPS;
+    const gridS = [];
+    const gridGex = [];
+    for (let i = 0; i <= STEPS; i++) {
+      const sVal = minS + i * stepS;
+      gridS.push(sVal);
+      gridGex.push(netGexAtHypSpot(sVal));
+    }
+
+    let bestBracket = null;
+    let minBracketDist = Infinity;
+    for (let i = 0; i < STEPS; i++) {
+      const g1 = gridGex[i], g2 = gridGex[i + 1];
+      if ((g1 <= 0 && g2 >= 0) || (g1 >= 0 && g2 <= 0)) {
+        const mid = 0.5 * (gridS[i] + gridS[i + 1]);
+        const dist = Math.abs(mid - spot);
+        if (dist < minBracketDist) {
+          minBracketDist = dist;
+          bestBracket = [gridS[i], gridS[i + 1], g1];
+        }
       }
     }
 
-    // 3. 挑選最具代表性之 14 個核心行權價供前端柱狀圖展示（自動囊括 Call/Put Wall 並過濾空殼半元檔）
-    const isIndexLike = Boolean(INDEX_CBOE_MAP[symbol] || ['SPY', 'QQQ', 'IWM', 'DIA'].includes(symbol));
-    const chartBand = isIndexLike ? 0.04 : 0.08;
-    let bandStrikes = allStrikes.filter(k => Math.abs(k - spot) / spot <= chartBand);
-    if (bandStrikes.length < 8) {
-      bandStrikes = allStrikes.filter(k => Math.abs(k - spot) / spot <= 0.15);
-    }
-    if (bandStrikes.length === 0) bandStrikes = allStrikes;
-
-    const selectedSet = new Set();
-    if (Math.abs(callWall - spot) / spot <= 0.12) selectedSet.add(callWall);
-    if (Math.abs(putWall - spot) / spot <= 0.12) selectedSet.add(putWall);
-    const nearestSpotStrike = allStrikes.reduce((a, b) => (Math.abs(b - spot) < Math.abs(a - spot) ? b : a), allStrikes[0]);
-    selectedSet.add(nearestSpotStrike);
-
-    const rankedByMass = [...bandStrikes].sort((a, b) => {
-      const massA = strikeMap[a].callGex + Math.abs(strikeMap[a].putGex);
-      const massB = strikeMap[b].callGex + Math.abs(strikeMap[b].putGex);
-      return massB - massA;
-    });
-    for (const k of rankedByMass) {
-      if (selectedSet.size >= 14) break;
-      selectedSet.add(k);
+    let gammaFlip = spot;
+    if (bestBracket) {
+      let [lo, hi, gLo] = bestBracket;
+      for (let iter = 0; iter < 12; iter++) {
+        const mid = 0.5 * (lo + hi);
+        const gMid = netGexAtHypSpot(mid);
+        if ((gLo <= 0 && gMid <= 0) || (gLo >= 0 && gMid >= 0)) {
+          lo = mid; gLo = gMid;
+        } else {
+          hi = mid;
+        }
+      }
+      gammaFlip = 0.5 * (lo + hi);
+    } else {
+      let minAbsIdx = 0;
+      for (let i = 1; i <= STEPS; i++) {
+        if (Math.abs(gridGex[i]) < Math.abs(gridGex[minAbsIdx])) minAbsIdx = i;
+      }
+      gammaFlip = gridS[minAbsIdx];
     }
 
-    const displayStrikes = Array.from(selectedSet).sort((a, b) => a - b);
-    const roundedTotalNet = Number(netGex.toFixed(2));
+    // 選取現價附近最核心 12 檔並強制納入 Call Wall / Put Wall，確保期權牆必顯示於圖表
+    const nearSet = new Set(
+      [...wallPool].sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot)).slice(0, 12)
+    );
+    nearSet.add(callWall);
+    nearSet.add(putWall);
+    const displayStrikes = Array.from(nearSet).sort((a, b) => a - b);
 
     const strikesData = displayStrikes.map(k => {
-      const b = strikeMap[k];
-      const cIv = b.callOi > 0 ? Number((b.callIvWeighted / b.callOi).toFixed(4)) : fallbackAtmIv;
-      const pIv = b.putOi > 0 ? Number((b.putIvWeighted / b.putOi).toFixed(4)) : fallbackAtmIv;
+      const st = strikeMap[k];
+      const cIv = st.callOi > 0 ? st.callIvSum / st.callOi : atmIv;
+      const pIv = st.putOi > 0 ? st.putIvSum / st.putOi : atmIv;
       return {
-        strike: Number(k.toFixed(1)),
-        callGex: Number(b.callGex.toFixed(3)),
-        putGex: Number(b.putGex.toFixed(3)),
-        netGex: Number((b.callGex + b.putGex).toFixed(3)),
-        callOi: Math.round(b.callOi),
-        putOi: Math.round(b.putOi),
-        callIv: cIv,
-        putIv: pIv,
-        T: Number(b.T.toFixed(6)),
-        exp: targetExpiry,
-        targetSession: targetYmd,
-        baseSpot: Number(spot.toFixed(2)),
-        baseTotalNetGex: roundedTotalNet
+        strike: Number(k.toFixed(2)),
+        callGex: Number(st.callGex.toFixed(5)),
+        putGex: Number(st.putGex.toFixed(5)),
+        netGex: Number((st.callGex + st.putGex).toFixed(5)),
+        callIv: Number(cIv.toFixed(4)),
+        putIv: Number(pIv.toFixed(4)),
+        T: Number(T.toFixed(6)),
+        exp: targetExp
       };
     });
 
@@ -723,10 +639,10 @@ async function computeCboeGex(symbol) {
     return {
       symbol,
       spot_price: Number(spot.toFixed(2)),
-      call_wall: Number(callWall.toFixed(1)),
-      put_wall: Number(putWall.toFixed(1)),
-      gamma_flip: gammaFlip,
-      net_gex: roundedTotalNet,
+      call_wall: Number(callWall.toFixed(2)),
+      put_wall: Number(putWall.toFixed(2)),
+      gamma_flip: Number(gammaFlip.toFixed(2)),
+      net_gex: Number(totalNetGex.toFixed(4)),
       strikes_data: strikesData,
       unusual_flows: topFlows,
       updated_at: new Date().toISOString()
@@ -761,7 +677,7 @@ export default async function handler(req, res) {
       if (gexOnly) {
         const gexRow = await computeCboeGex(rawSym);
         if (!gexRow) {
-          return res.status(404).json({ error: `找不到 ${rawSym} 的 CBOE 期權數據 / No CBOE options chain for ${rawSym}` });
+          return res.status(404).json({ error: `找不到 ${rawSym} 的下場次 CBOE 期權數據 / No CBOE options chain for ${rawSym}` });
         }
         return res.status(200).json({ gexRow });
       }
