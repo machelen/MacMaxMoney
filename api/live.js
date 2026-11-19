@@ -64,30 +64,64 @@ function computeObosV2(symbol, resDaily, resHourly) {
 
   if (bars.length < 25) return null;
   const n = bars.length;
+
+  // 同步最新盤中報價至最後一根日 K 線
+  const price = Number((meta.regularMarketPrice || bars[n - 1].c).toFixed(2));
+  bars[n - 1].c = price;
+  bars[n - 1].h = Math.max(bars[n - 1].h, price);
+  bars[n - 1].l = Math.min(bars[n - 1].l, price);
+
   const last = bars[n - 1];
   const prev = bars[n - 2];
-  const price = Number((meta.regularMarketPrice || last.c).toFixed(2));
   const prevClose = prev.c || price;
   const changePct = prevClose ? Number((((price - prevClose) / prevClose) * 100).toFixed(2)) : 0;
 
-  // 計算 EMA20, EMA50, EMA200
-  const calcEma = (span) => {
+  // 計算 EMA5, EMA20, EMA50, EMA200 序列
+  const calcEmaSeries = (span) => {
     const k = 2 / (span + 1);
-    let ema = bars[0].c;
-    for (let i = 1; i < n; i++) ema = bars[i].c * k + ema * (1 - k);
-    return ema;
+    const arr = new Array(n);
+    arr[0] = bars[0].c;
+    for (let i = 1; i < n; i++) {
+      arr[i] = bars[i].c * k + arr[i - 1] * (1 - k);
+    }
+    return arr;
   };
-  const ema20 = calcEma(20);
-  const ema50 = calcEma(50);
-  const ema200 = calcEma(Math.min(200, n));
-  const isBull = price >= ema200;
+
+  const ema5Arr = calcEmaSeries(5);
+  const ema5Now = ema5Arr[n - 1];
+  const ema5Prev = ema5Arr[n - 2];
+  const ema20 = calcEmaSeries(20)[n - 1];
+  const ema50 = calcEmaSeries(50)[n - 1];
+  const ema200 = calcEmaSeries(Math.min(200, n))[n - 1];
+
+  const isAbove200 = price >= ema200;
+  const isMidBull = ema20 > ema50;
+
+  // 三級牛熊動態門檻（防破年線前夕門檻滯後）
+  let osThresh = -75;
+  let obThresh = 75;
+  let regimeTag = '';
+
+  if (isAbove200 && isMidBull) {
+    osThresh = -60;
+    obThresh = 85;
+    regimeTag = '牛市共振';
+  } else if (isAbove200 && !isMidBull) {
+    osThresh = -75;
+    obThresh = 75;
+    regimeTag = '年線上死叉';
+  } else {
+    osThresh = -85;
+    obThresh = 60;
+    regimeTag = '熊市(<EMA200)';
+  }
 
   let trendTag = '震盪整理';
   if (price > ema20 && ema20 > ema50) trendTag = '多頭趨勢';
   else if (price < ema20 && ema20 < ema50) trendTag = '空頭承壓';
-  else if (price > ema20) trendTag = '反彈修復';
+  else if (price >= ema5Now) trendTag = '站上EMA5';
 
-  const dailySignal = `${isBull ? '牛市(>EMA200)' : '熊市(<EMA200)'}·${trendTag}`;
+  const dailySignal = `${regimeTag}·${trendTag}`;
 
   // 計算 4H 信號
   let h4Signal = trendTag;
@@ -151,18 +185,24 @@ function computeObosV2(symbol, resDaily, resHourly) {
     return clamp(Math.round(momV2 + bbV2), -100, 100);
   };
 
+  const obos3 = calcSingleBarObosV2(n - 3);
   const obosPrev = calcSingleBarObosV2(n - 2);
   const obosNow = calcSingleBarObosV2(n - 1);
 
-  const osThresh = isBull ? -60 : -85;
-  const obThresh = isBull ? 85 : 60;
+  // EMA5 防死貓跳確認邏輯（支援當日直接站上 EMA5，或超賣勾頭後第 2-3 日補站上 EMA5 觸發）
+  const aboveEma5 = price >= ema5Now;
+  const justReclaimedEma5 = prev.c < ema5Prev && aboveEma5;
+  const recentOversold = Math.min(obosPrev, obos3) <= osThresh;
+  const directBuy = obosPrev <= osThresh && obosNow > obosPrev && last.c >= last.o && aboveEma5;
+  const delayedBuy = recentOversold && justReclaimedEma5 && obosNow > obosPrev && obosNow < 25 && last.c >= last.o;
 
-  // 六色閉環實戰燈號判定（含右側買賣點、動能減速止盈、破底失效止損、極值觀察）
   let obosLevel = '';
-  if (obosPrev <= osThresh && obosNow > obosPrev && last.c >= last.o) {
-    obosLevel = `🟢 右側買點觸發 (${fmtSigned(obosPrev)}→${fmtSigned(obosNow)})`;
+  if (directBuy || delayedBuy) {
+    obosLevel = `🟢 右側買點 (${fmtSigned(obosPrev)}→${fmtSigned(obosNow)}·站穩EMA5)`;
+  } else if (obosPrev <= osThresh && obosNow > obosPrev && last.c >= last.o && !aboveEma5) {
+    obosLevel = `🟡 勾頭未過EMA5 (防死貓跳)`;
   } else if (obosPrev >= obThresh && obosNow < obosPrev && last.c <= last.o) {
-    obosLevel = `🔴 右側賣點觸發 (${fmtSigned(obosPrev)}→${fmtSigned(obosNow)})`;
+    obosLevel = `🔴 右側賣點 (${fmtSigned(obosPrev)}→${fmtSigned(obosNow)})`;
   } else if (obosPrev >= 45 && obosPrev < obThresh && (obosPrev - obosNow) >= 12 && last.c < last.o) {
     obosLevel = `🟣 動能減速止盈 (${fmtSigned(obosPrev)}→${fmtSigned(obosNow)})`;
   } else if (obosNow <= -40 && (obosNow - obosPrev) <= -10 && price < ema20 && last.c < last.o) {
@@ -172,9 +212,9 @@ function computeObosV2(symbol, resDaily, resHourly) {
   } else if (obosNow >= obThresh) {
     obosLevel = `🟠 超買觀察中 (門檻+${obThresh})`;
   } else if (obosNow >= 35) {
-    obosLevel = `偏強推進 (止盈警戒+45/+${obThresh})`;
+    obosLevel = `偏強推進 (門檻+${obThresh})`;
   } else if (obosNow <= -35) {
-    obosLevel = `偏弱整理 (買點門檻${osThresh})`;
+    obosLevel = `偏弱整理 (門檻${osThresh})`;
   } else {
     obosLevel = `中性區間 (門檻${osThresh}/+${obThresh})`;
   }
@@ -312,7 +352,6 @@ async function computeCboeGex(symbol) {
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, max-age=0');
 
-  // 模式 A：網頁新增觀察標的時，即時運算 OBOS v2.0 六色燈號與期權 GEX
   if (req.query?.analyze) {
     const rawSym = String(req.query.analyze).trim().toUpperCase();
     const yfSym = INDEX_YF_MAP[rawSym] || encodeURIComponent(rawSym.replace('.', '-'));
@@ -334,7 +373,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // 模式 B：每 5 秒動態拉取全部大盤、自選股與持倉股實時報價
   const defaultList = ['SPX', 'NDX', 'SOX', 'VIX', 'DXY', 'US10Y', 'QQQ', 'IWM', 'SOXL', 'NVDA'];
   const requested = req.query?.symbols
     ? String(req.query.symbols).split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
