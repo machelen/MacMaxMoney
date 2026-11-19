@@ -21,8 +21,208 @@ const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 };
 
+const SPAM_REGEX = /fool\.com|investorplace|insidermonkey|gobankingrates|247wallst|zacks\.com|marketbeat|simplywall\.st|warren buffett|millionaire|if you invested|unstoppable stock|stocks? to buy|prediction:|stock market crash|forget |here's why|motley fool|retirees?|social security|cathie wood|no-brainer|screaming buy|\b[1-9] stocks?\b/i;
+
+const KNOWN_TICKERS = [
+  'NVDA', 'TSLA', 'AAPL', 'MSFT', 'AMZN', 'META', 'GOOGL', 'GOOG', 'AVGO', 'AMD',
+  'PLTR', 'TSM', 'ASML', 'ARM', 'MU', 'INTC', 'SMCI', 'SOXL', 'QQQ', 'SPY', 'SPX',
+  'IWM', 'NFLX', 'COIN', 'MSTR', 'JPM', 'GS', 'LLY', 'XOM', 'BA', 'UBER', 'CRM', 'ORCL'
+];
+
+const COMPANY_KEYWORD_MAP = {
+  nvidia: 'NVDA', tesla: 'TSLA', apple: 'AAPL', microsoft: 'MSFT', amazon: 'AMZN',
+  meta: 'META', alphabet: 'GOOGL', google: 'GOOGL', broadcom: 'AVGO', palantir: 'PLTR',
+  tsmc: 'TSM', micron: 'MU', intel: 'INTC', netflix: 'NFLX', coinbase: 'COIN',
+  boeing: 'BA', oracle: 'ORCL', jpmorgan: 'JPM', goldman: 'GS'
+};
+
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const fmtSigned = (n) => (n > 0 ? `+${n}` : `${n}`);
+
+function decodeXmlText(str = '') {
+  return str
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;|&#x27;/g, "'")
+    .replace(/&#8217;|&#8216;/g, "'")
+    .replace(/&#8220;|&#8221;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function translateEnToZh(text) {
+  if (!text) return '';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const q = encodeURIComponent(text);
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-TW&dt=t&q=${q}`;
+    const r = await fetch(url, { headers: YF_HEADERS, signal: controller.signal });
+    clearTimeout(timer);
+    if (!r.ok) return text;
+    const arr = (await r.json())?.[0] || [];
+    return arr.map(seg => seg?.[0] || '').join('').replace(/。。+/g, '。').trim() || text;
+  } catch {
+    clearTimeout(timer);
+    return text;
+  }
+}
+
+function classifyNewsItem(title, desc, watchSet) {
+  const combined = `${title} ${desc}`;
+  const lower = combined.toLowerCase();
+
+  let category = 'SECTOR';
+  let score = 2;
+
+  if (/\b(fed|fomc|powell|cpi|pce|ppi|payroll|nonfarm|jobless|inflation|treasury|yield|tariff|trump|china|trade war|export|rate cut|rate hike|gdp)\b/i.test(combined)) {
+    category = 'MACRO';
+    score += 5;
+  } else if (/\b(earnings|eps|revenue|guidance|forecast|q[1-4]|quarter|beats|misses|profit|margin|buyback|dividend|deliveries)\b/i.test(combined)) {
+    category = 'EARNINGS';
+    score += 5;
+  } else if (/\b(upgrade[sd]?|downgrade[sd]?|price target|overweight|underweight|outperform|initiates|bofa|goldman|morgan stanley|jpmorgan|citi|wedbush|barclays|bernstein|ubs)\b/i.test(combined)) {
+    category = 'RATING';
+    score += 4;
+  }
+
+  let impact = 'WATCH';
+  if (/\b(beat[s]?|surge[sd]?|jump[sd]?|rall(y|ies)|upgrade[sd]?|raises? (guidance|target|forecast)|record|approval|wins?|deal|buyback)\b/i.test(combined)) {
+    impact = 'BULLISH';
+    score += 2;
+  } else if (/\b(miss(es)?|cut[s]?|slash(es)?|downgrade[sd]?|plunge[sd]?|drop[s]?|tumble[sd]?|fall[s]?|probe|lawsuit|subpoena|tariff|curb|ban|delay|recall|warn[s]?)\b/i.test(combined)) {
+    impact = 'BEARISH';
+    score += 2;
+  } else if (category === 'MACRO' || /\b(fed|cpi|pce|powell|fomc|volatility|standoff|options)\b/i.test(combined)) {
+    impact = 'VOLATILE';
+    score += 2;
+  }
+
+  const matched = new Set();
+  const upperWords = combined.match(/\b[A-Z]{2,5}\b/g) || [];
+  upperWords.forEach(w => {
+    if (watchSet.has(w) || KNOWN_TICKERS.includes(w)) matched.add(w);
+  });
+  Object.entries(COMPANY_KEYWORD_MAP).forEach(([kw, tk]) => {
+    if (lower.includes(kw)) matched.add(tk);
+  });
+  if (/\b(semiconductor|chip|ai server|gpu|blackwell|foundry)\b/i.test(combined) && matched.size === 0) {
+    matched.add('NVDA');
+    matched.add('SOXL');
+  }
+
+  const tickers = Array.from(matched).slice(0, 4);
+  if (tickers.some(t => watchSet.has(t))) score += 3;
+
+  return { category, impact, tickers: tickers.length ? tickers : ['MACRO'], score };
+}
+
+async function fetchActionableIntel(watchSymbols) {
+  const watchSet = new Set(watchSymbols);
+  const stockQuery = watchSymbols.filter(s => !INDEX_YF_MAP[s]).slice(0, 10);
+  const yfList = [...new Set(['SPY', 'QQQ', 'NVDA', 'TSLA', 'SOXL', 'AMD', ...stockQuery])].join(',');
+
+  const feeds = [
+    { source: 'MarketWatch', url: 'https://feeds.content.dowjones.io/public/rss/mw_marketpulse' },
+    { source: 'CNBC Markets', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664' },
+    { source: 'CNBC Earnings', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135' },
+    { source: 'CNBC Economy', url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258' },
+    { source: 'Yahoo Finance', url: `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${yfList}&region=US&lang=en-US` }
+  ];
+
+  const rawItems = [];
+  await Promise.all(
+    feeds.map(async (f) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4200);
+      try {
+        const r = await fetch(f.url, { headers: YF_HEADERS, signal: controller.signal });
+        clearTimeout(timer);
+        if (!r.ok) return;
+        const xml = await r.text();
+        const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
+        for (const block of itemBlocks.slice(0, 14)) {
+          const title = decodeXmlText((block.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '');
+          const link = decodeXmlText((block.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1] || '');
+          const desc = decodeXmlText((block.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '');
+          const pubStr = decodeXmlText((block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i) || [])[1] || '');
+          if (!title || title.length < 18) continue;
+          if (SPAM_REGEX.test(title) || SPAM_REGEX.test(link)) continue;
+
+          const pubMs = Date.parse(pubStr) || Date.now();
+          const ageHours = Math.max(0, (Date.now() - pubMs) / 3600000);
+          if (ageHours > 48) continue;
+
+          rawItems.push({ source: f.source, title, link, desc: desc.slice(0, 180), pubMs, ageHours });
+        }
+      } catch {
+        clearTimeout(timer);
+      }
+    })
+  );
+
+  // 去重並按「催化劑權重 + 時效性」排序
+  const seenKeys = new Set();
+  const scored = [];
+  for (const it of rawItems) {
+    const normKey = it.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 42);
+    if (seenKeys.has(normKey)) continue;
+    seenKeys.add(normKey);
+
+    const meta = classifyNewsItem(it.title, it.desc, watchSet);
+    const recencyBonus = it.ageHours <= 3 ? 4 : (it.ageHours <= 10 ? 2 : 0);
+    scored.push({ ...it, ...meta, totalScore: meta.score + recencyBonus });
+  }
+
+  scored.sort((a, b) => b.totalScore - a.totalScore || b.pubMs - a.pubMs);
+  const topNews = scored.slice(0, 8);
+
+  const buildTakeawayEn = (it) => {
+    if (it.desc && it.desc.length > 25 && it.desc.toLowerCase() !== it.title.toLowerCase()) {
+      return it.desc.length > 150 ? `${it.desc.slice(0, 147)}...` : it.desc;
+    }
+    if (it.category === 'MACRO') return 'Monitor US10Y yields, VIX, and SPX Gamma Flip reaction for intraday index direction.';
+    if (it.category === 'EARNINGS') return `Watch ${it.tickers.join('/')} post-earnings volume expansion and Call/Put Wall defense.`;
+    if (it.category === 'RATING') return `Institutional rating catalyst on ${it.tickers.join('/')}; confirm entry with EMA5 & OBOS hook.`;
+    return `Key catalyst for ${it.tickers.join('/')}; avoid chasing extended moves inside negative GEX.`;
+  };
+
+  const enriched = await Promise.all(
+    topNews.map(async (it) => {
+      const takeawayEn = buildTakeawayEn(it);
+      const [titleZh, takeawayZh] = await Promise.all([
+        translateEnToZh(it.title),
+        translateEnToZh(takeawayEn)
+      ]);
+      const mins = Math.max(1, Math.round((Date.now() - it.pubMs) / 60000));
+      const timeAgo = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
+
+      return {
+        kind: 'intel_v2',
+        id: `news_${it.pubMs}_${it.tickers[0]}`,
+        category: it.category,
+        impact: it.impact,
+        tickers: it.tickers,
+        source: it.source,
+        timeAgo,
+        url: it.link,
+        title_en: it.title,
+        title_zh: titleZh,
+        takeaway_en: takeawayEn,
+        takeaway_zh: takeawayZh
+      };
+    })
+  );
+
+  const utcHour = new Date().getUTCHours();
+  const sessionType = utcHour < 13 ? '盤前簡報' : (utcHour < 20 ? '盤中快訊' : '盤後總結');
+
+  return { session_type: sessionType, items: enriched };
+}
 
 function bsGamma(S, K, T, r, sigma) {
   if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
@@ -65,7 +265,6 @@ function computeObosV2(symbol, resDaily, resHourly) {
   if (bars.length < 25) return null;
   const n = bars.length;
 
-  // 同步最新盤中報價至最後一根日 K 線
   const price = Number((meta.regularMarketPrice || bars[n - 1].c).toFixed(2));
   bars[n - 1].c = price;
   bars[n - 1].h = Math.max(bars[n - 1].h, price);
@@ -76,14 +275,11 @@ function computeObosV2(symbol, resDaily, resHourly) {
   const prevClose = prev.c || price;
   const changePct = prevClose ? Number((((price - prevClose) / prevClose) * 100).toFixed(2)) : 0;
 
-  // 計算 EMA5, EMA20, EMA50, EMA200 序列
   const calcEmaSeries = (span) => {
     const k = 2 / (span + 1);
     const arr = new Array(n);
     arr[0] = bars[0].c;
-    for (let i = 1; i < n; i++) {
-      arr[i] = bars[i].c * k + arr[i - 1] * (1 - k);
-    }
+    for (let i = 1; i < n; i++) arr[i] = bars[i].c * k + arr[i - 1] * (1 - k);
     return arr;
   };
 
@@ -97,23 +293,11 @@ function computeObosV2(symbol, resDaily, resHourly) {
   const isAbove200 = price >= ema200;
   const isMidBull = ema20 > ema50;
 
-  // 三級牛熊動態門檻（防破年線前夕門檻滯後）
-  let osThresh = -75;
-  let obThresh = 75;
-  let regimeTag = '';
-
+  let osThresh = -75, obThresh = 75, regimeTag = '年線上死叉';
   if (isAbove200 && isMidBull) {
-    osThresh = -60;
-    obThresh = 85;
-    regimeTag = '牛市共振';
-  } else if (isAbove200 && !isMidBull) {
-    osThresh = -75;
-    obThresh = 75;
-    regimeTag = '年線上死叉';
-  } else {
-    osThresh = -85;
-    obThresh = 60;
-    regimeTag = '熊市(<EMA200)';
+    osThresh = -60; obThresh = 85; regimeTag = '牛市共振';
+  } else if (!isAbove200) {
+    osThresh = -85; obThresh = 60; regimeTag = '熊市(<EMA200)';
   }
 
   let trendTag = '震盪整理';
@@ -123,7 +307,6 @@ function computeObosV2(symbol, resDaily, resHourly) {
 
   const dailySignal = `${regimeTag}·${trendTag}`;
 
-  // 計算 4H 信號
   let h4Signal = trendTag;
   const qH = resHourly?.indicators?.quote?.[0]?.close?.filter(v => v != null) || [];
   if (qH.length >= 40) {
@@ -134,7 +317,6 @@ function computeObosV2(symbol, resDaily, resHourly) {
     h4Signal = price > e4h ? '4H多頭支撐' : '4H回調承壓';
   }
 
-  // 計算 Wilder RSI(14) 與 ATR(14) 序列
   let wGain = 0, wLoss = 0, atr = 0;
   for (let i = 1; i <= 14; i++) {
     const d = bars[i].c - bars[i - 1].c;
@@ -151,7 +333,6 @@ function computeObosV2(symbol, resDaily, resHourly) {
     wGain = (wGain * 13 + (d > 0 ? d : 0)) / 14;
     wLoss = (wLoss * 13 + (d < 0 ? -d : 0)) / 14;
     wRsiArr[i] = wLoss === 0 ? 100 : 100 - 100 / (1 + wGain / wLoss);
-
     const tr = Math.max(bars[i].h - bars[i].l, Math.abs(bars[i].h - bars[i - 1].c), Math.abs(bars[i].l - bars[i - 1].c));
     atr = (atr * 13 + tr) / 14;
     atrArr[i] = atr || 1;
@@ -175,10 +356,7 @@ function computeObosV2(symbol, resDaily, resHourly) {
       if (tpNow > tpPrev) posMf += rmf;
       else if (tpNow < tpPrev) negMf += rmf;
     }
-    const mfi = volTotal === 0
-      ? wRsiArr[idx]
-      : (negMf === 0 ? 100 : 100 - 100 / (1 + posMf / negMf));
-
+    const mfi = volTotal === 0 ? wRsiArr[idx] : (negMf === 0 ? 100 : 100 - 100 / (1 + posMf / negMf));
     const damper = clamp(std20 / (1.5 * (atrArr[idx] || 1)), 0.5, 1.0);
     const momV2 = (0.6 * wRsiArr[idx] + 0.4 * mfi - 50) * 1.2;
     const bbV2 = clamp(z * 20, -50, 50) * damper;
@@ -189,7 +367,6 @@ function computeObosV2(symbol, resDaily, resHourly) {
   const obosPrev = calcSingleBarObosV2(n - 2);
   const obosNow = calcSingleBarObosV2(n - 1);
 
-  // EMA5 防死貓跳確認邏輯（支援當日直接站上 EMA5，或超賣勾頭後第 2-3 日補站上 EMA5 觸發）
   const aboveEma5 = price >= ema5Now;
   const justReclaimedEma5 = prev.c < ema5Prev && aboveEma5;
   const recentOversold = Math.min(obosPrev, obos3) <= osThresh;
@@ -238,7 +415,7 @@ async function computeCboeGex(symbol) {
   const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSym}.json`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5500);
+  const timer = setTimeout(() => controller.abort(), 5800);
 
   try {
     const r = await fetch(url, { headers: YF_HEADERS, signal: controller.signal });
@@ -352,11 +529,34 @@ async function computeCboeGex(symbol) {
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, max-age=0');
 
+  // 模式 A：即時挖掘雙語實戰情報與催化劑
+  if (req.query?.intel) {
+    const syms = req.query.symbols
+      ? String(req.query.symbols).split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+      : ['SPX', 'QQQ', 'NVDA', 'TSLA', 'SOXL', 'AMD'];
+    try {
+      const intelData = await fetchActionableIntel(syms);
+      return res.status(200).json(intelData);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // 模式 B：新增自選觀察股或新增期權 GEX 自選股
   if (req.query?.analyze) {
     const rawSym = String(req.query.analyze).trim().toUpperCase();
     const yfSym = INDEX_YF_MAP[rawSym] || encodeURIComponent(rawSym.replace('.', '-'));
+    const gexOnly = req.query?.gexOnly === '1';
 
     try {
+      if (gexOnly) {
+        const gexRow = await computeCboeGex(rawSym);
+        if (!gexRow) {
+          return res.status(404).json({ error: `找不到 ${rawSym} 的 CBOE 期權數據 / No CBOE options chain for ${rawSym}` });
+        }
+        return res.status(200).json({ gexRow });
+      }
+
       const [resDaily, resHourly, gexRow] = await Promise.all([
         fetchYfData(yfSym, '1d', '1y'),
         fetchYfData(yfSym, '60m', '1mo'),
@@ -365,7 +565,7 @@ export default async function handler(req, res) {
 
       const marketRow = computeObosV2(rawSym, resDaily, resHourly);
       if (!marketRow) {
-        return res.status(404).json({ error: `找不到代碼 ${rawSym} 或歷史 K 線不足` });
+        return res.status(404).json({ error: `找不到代碼 ${rawSym} / Symbol ${rawSym} not found` });
       }
       return res.status(200).json({ marketRow, gexRow });
     } catch (err) {
@@ -373,6 +573,7 @@ export default async function handler(req, res) {
     }
   }
 
+  // 模式 C：每 5 秒動態拉取實時現價
   const defaultList = ['SPX', 'NDX', 'SOX', 'VIX', 'DXY', 'US10Y', 'QQQ', 'IWM', 'SOXL', 'NVDA'];
   const requested = req.query?.symbols
     ? String(req.query.symbols).split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
