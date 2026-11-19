@@ -1,9 +1,11 @@
 import os
+import re
 import json
 import math
 import datetime
 import urllib.parse
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 import requests
 import numpy as np
 import pandas as pd
@@ -34,38 +36,47 @@ DEFAULT_MARKET_INDEXES = [
     {"symbol": "US10Y", "yf_ticker": "%5ETNX", "name": "10年期美債收益率"},
 ]
 
-DEFAULT_GEX_TICKERS = [
-    {"symbol": "SPX", "cboe_ticker": "_SPX"},
-    {"symbol": "QQQ", "cboe_ticker": "QQQ"},
-    {"symbol": "IWM", "cboe_ticker": "IWM"},
-    {"symbol": "SOXL", "cboe_ticker": "SOXL"},
-    {"symbol": "NVDA", "cboe_ticker": "NVDA"},
-]
-
+DEFAULT_GEX_TICKERS = ["SPX", "QQQ", "IWM", "SOXL", "NVDA"]
 INDEX_YF_MAP = {item["symbol"]: item["yf_ticker"] for item in DEFAULT_MARKET_INDEXES}
 INDEX_CBOE_MAP = {"SPX": "_SPX", "NDX": "_NDX", "VIX": "_VIX", "RUT": "_RUT"}
 NO_OPTION_SYMBOLS = {"DXY", "US10Y", "SOX"}
 
-DEFAULT_FOCUS_STOCKS = [
-    {"ticker": "NVDA", "name": "NVIDIA Corp.", "sector": "AI 算力晶片"},
-    {"ticker": "SOXL", "name": "3倍做多半導體 ETF", "sector": "槓桿 ETF"},
-    {"ticker": "TSLA", "name": "Tesla Inc.", "sector": "自駕與機器人"},
-    {"ticker": "AMD", "name": "Advanced Micro Devices", "sector": "AI 半導體"},
-    {"ticker": "PLTR", "name": "Palantir Tech", "sector": "AI 企業軟體"},
-    {"ticker": "AVGO", "name": "Broadcom Inc.", "sector": "ASIC 與網通"},
-]
+SPAM_PATTERN = re.compile(
+    r"fool\.com|investorplace|insidermonkey|gobankingrates|247wallst|zacks\.com|marketbeat|"
+    r"warren buffett|millionaire|if you invested|unstoppable stock|stocks? to buy|prediction:|"
+    r"stock market crash|forget |here's why|motley fool|retirees?|social security|cathie wood|"
+    r"no-brainer|screaming buy|\b[1-9] stocks?\b",
+    re.IGNORECASE
+)
+
+KNOWN_TICKERS = {
+    "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AVGO", "AMD", "PLTR",
+    "TSM", "ARM", "MU", "INTC", "SMCI", "SOXL", "QQQ", "SPY", "SPX", "IWM", "NFLX",
+    "COIN", "MSTR", "JPM", "GS", "LLY", "XOM", "BA", "ORCL"
+}
+
+COMPANY_MAP = {
+    "nvidia": "NVDA", "tesla": "TSLA", "apple": "AAPL", "microsoft": "MSFT",
+    "amazon": "AMZN", "meta": "META", "alphabet": "GOOGL", "broadcom": "AVGO",
+    "palantir": "PLTR", "tsmc": "TSM", "micron": "MU", "intel": "INTC", "coinbase": "COIN"
+}
 
 def fmt_signed(n):
     return f"+{n}" if n > 0 else f"{n}"
 
-def fetch_custom_watchlist_from_db():
-    """從 Supabase 讀取用戶在網頁端新增的所有自選觀察標的"""
+def clean_html(raw):
+    if not raw:
+        return ""
+    txt = re.sub(r"<[^>]+>", " ", raw)
+    return re.sub(r"\s+", " ", txt).strip()
+
+def fetch_table_rows(path):
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/market_signals?select=symbol,name", headers=HEADERS, timeout=12)
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=HEADERS, timeout=12)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        print(f"[Watchlist Read Warning] {e}")
+        print(f"[DB Read Warning] {path}: {e}")
     return []
 
 def translate_to_zh_hk(text):
@@ -77,7 +88,8 @@ def translate_to_zh_hk(text):
         resp = requests.get(url, headers=YF_HEADERS, timeout=8)
         if resp.status_code == 200:
             arr = resp.json()[0]
-            return "".join(seg[0] for seg in arr if seg and seg[0])
+            out = "".join(seg[0] for seg in arr if seg and seg[0])
+            return re.sub(r"。+", "。", out).strip()
     except Exception:
         pass
     return text
@@ -110,8 +122,7 @@ def calc_wilder_rsi_series(close_s, period=14):
     avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
+    return (100 - (100 / (1 + rs))).fillna(50.0)
 
 def calc_mfi_series(df, period=14):
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -121,8 +132,7 @@ def calc_mfi_series(df, period=14):
     neg_mf = pd.Series(np.where(tp_diff < 0, rmf, 0.0)).rolling(period).sum()
     vol_sum = df["volume"].rolling(period).sum()
     mfr = pos_mf / neg_mf.replace(0, np.nan)
-    mfi = 100 - (100 / (1 + mfr))
-    mfi = mfi.fillna(50.0)
+    mfi = (100 - (100 / (1 + mfr))).fillna(50.0)
     return pd.Series(np.where(vol_sum == 0, np.nan, mfi))
 
 def calc_atr_series(df, period=14):
@@ -146,7 +156,6 @@ def calc_obos_v2_and_signals(idx):
         prev_close = float(close.iloc[-2])
         change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
-        # 計算 EMA5, EMA20, EMA50, EMA200
         ema5_s = close.ewm(span=5, adjust=False).mean()
         ema5_now = float(ema5_s.iloc[-1])
         ema5_prev = float(ema5_s.iloc[-2])
@@ -154,22 +163,12 @@ def calc_obos_v2_and_signals(idx):
         ema50_d = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200_d = float(close.ewm(span=min(200, len(close)), adjust=False).mean().iloc[-1])
 
-        is_above_200 = price >= ema200_d
-        is_mid_bull = ema20_d > ema50_d
-
-        # 三級牛熊動態門檻（防破年線前夕門檻滯後）
-        if is_above_200 and is_mid_bull:
-            os_thresh = -60
-            ob_thresh = 85
-            regime_tag = "牛市共振"
-        elif is_above_200 and not is_mid_bull:
-            os_thresh = -75
-            ob_thresh = 75
-            regime_tag = "年線上死叉"
+        if price >= ema200_d and ema20_d > ema50_d:
+            os_thresh, ob_thresh, regime_tag = -60, 85, "牛市共振"
+        elif price >= ema200_d:
+            os_thresh, ob_thresh, regime_tag = -75, 75, "年線上死叉"
         else:
-            os_thresh = -85
-            ob_thresh = 60
-            regime_tag = "熊市(<EMA200)"
+            os_thresh, ob_thresh, regime_tag = -85, 60, "熊市(<EMA200)"
 
         if price > ema20_d and ema20_d > ema50_d:
             trend_tag = "多頭趨勢"
@@ -186,16 +185,10 @@ def calc_obos_v2_and_signals(idx):
             close_4h = df_1h["close"].iloc[::4].reset_index(drop=True)
             ema20_4h = float(close_4h.ewm(span=20, adjust=False).mean().iloc[-1])
             rsi_4h = float(calc_wilder_rsi_series(close_4h, 14).iloc[-1])
-            if price > ema20_4h and rsi_4h > 55:
-                h4_signal = "4H多頭共振"
-            elif price < ema20_4h and rsi_4h < 45:
-                h4_signal = "4H回調轉弱"
-            else:
-                h4_signal = "4H區間盤整"
+            h4_signal = "4H多頭共振" if (price > ema20_4h and rsi_4h > 55) else ("4H回調轉弱" if (price < ema20_4h and rsi_4h < 45) else "4H區間盤整")
         else:
             h4_signal = trend_tag
 
-        # OBOS v2.1 序列運算
         w_rsi = calc_wilder_rsi_series(close, 14)
         mfi_s = calc_mfi_series(df, 14).fillna(w_rsi)
         atr_s = calc_atr_series(df, 14).replace(0, 1.0)
@@ -204,21 +197,15 @@ def calc_obos_v2_and_signals(idx):
 
         z_s = (close - ma20_s) / std20_s
         damper_s = (std20_s / (1.5 * atr_s)).clip(0.5, 1.0)
-        mom_v2 = (0.6 * w_rsi + 0.4 * mfi_s - 50.0) * 1.2
-        bb_v2 = (z_s * 20.0).clip(-50.0, 50.0) * damper_s
-        obos_series = (mom_v2 + bb_v2).fillna(0.0).round().clip(-100, 100)
+        obos_series = ((0.6 * w_rsi + 0.4 * mfi_s - 50.0) * 1.2 + (z_s * 20.0).clip(-50.0, 50.0) * damper_s).fillna(0.0).round().clip(-100, 100)
 
-        obos_3 = int(obos_series.iloc[-3])
-        obos_prev = int(obos_series.iloc[-2])
-        obos_now = int(obos_series.iloc[-1])
+        obos_3, obos_prev, obos_now = int(obos_series.iloc[-3]), int(obos_series.iloc[-2]), int(obos_series.iloc[-1])
         last_open = float(df["open"].iloc[-1])
 
-        # EMA5 防死貓跳確認邏輯（支援當日直接站上 EMA5，或超賣勾頭後第 2-3 日補站上 EMA5 觸發）
         above_ema5 = price >= ema5_now
         just_reclaimed_ema5 = (prev_close < ema5_prev) and above_ema5
-        recent_oversold = min(obos_prev, obos_3) <= os_thresh
         direct_buy = (obos_prev <= os_thresh) and (obos_now > obos_prev) and (price >= last_open) and above_ema5
-        delayed_buy = recent_oversold and just_reclaimed_ema5 and (obos_now > obos_prev) and (obos_now < 25) and (price >= last_open)
+        delayed_buy = (min(obos_prev, obos_3) <= os_thresh) and just_reclaimed_ema5 and (obos_now > obos_prev) and (obos_now < 25) and (price >= last_open)
 
         if direct_buy or delayed_buy:
             obos_level = f"🟢 右側買點 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)}·站穩EMA5)"
@@ -241,11 +228,9 @@ def calc_obos_v2_and_signals(idx):
         else:
             obos_level = f"中性區間 (門檻{os_thresh}/+{ob_thresh})"
 
-        resolved_name = idx.get("name") or meta.get("shortName") or idx["symbol"]
-
         return {
             "symbol": idx["symbol"],
-            "name": resolved_name,
+            "name": idx.get("name") or meta.get("shortName") or idx["symbol"],
             "price": round(price, 2),
             "change_pct": change_pct,
             "daily_signal": daily_signal,
@@ -267,14 +252,12 @@ def bs_gamma(S, K, T, r, sigma):
     except Exception:
         return 0.0
 
-def calc_gex_for_ticker(item):
-    symbol = item["symbol"]
+def calc_gex_for_symbol(symbol):
     if symbol in NO_OPTION_SYMBOLS:
         return None
-    cboe_ticker = item["cboe_ticker"]
+    cboe_ticker = INDEX_CBOE_MAP.get(symbol, symbol.replace("-", ""))
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_ticker}.json"
-    strike_map = {}
-    unusual_list = []
+    strike_map, unusual_list = {}, []
 
     try:
         resp = requests.get(cboe_url, headers=YF_HEADERS, timeout=20)
@@ -295,16 +278,11 @@ def calc_gex_for_ticker(item):
             exp_str = f"20{tail[:2]}-{tail[2:4]}-{tail[4:6]}"
             opt_type = tail[6]
             strike = int(tail[7:]) / 1000.0
-
             try:
-                exp_date = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
-                days_to_exp = (exp_date - today).days
+                days_to_exp = (datetime.datetime.strptime(exp_str, "%Y-%m-%d").date() - today).days
             except Exception:
                 days_to_exp = 7
-
-            if days_to_exp < 0 or days_to_exp > 45:
-                continue
-            if abs(strike - spot) / spot > 0.12:
+            if days_to_exp < 0 or days_to_exp > 45 or abs(strike - spot) / spot > 0.12:
                 continue
 
             oi = float(opt.get("open_interest") or 0.0)
@@ -312,14 +290,11 @@ def calc_gex_for_ticker(item):
             iv = float(opt.get("iv") or 0.35)
             gamma = float(opt.get("gamma") or 0.0)
             last_p = float(opt.get("last_trade_price") or opt.get("ask") or 0.0)
-
             if gamma <= 0 and oi > 0:
-                T = max(days_to_exp / 365.0, 1.0 / 365.0)
-                gamma = bs_gamma(spot, strike, T, 0.045, max(iv, 0.25))
+                gamma = bs_gamma(spot, strike, max(days_to_exp / 365.0, 1.0 / 365.0), 0.045, max(iv, 0.25))
 
             gex_val = gamma * oi * 100 * (spot ** 2) * 0.01 / 1e9
-            if strike not in strike_map:
-                strike_map[strike] = {"callGex": 0.0, "putGex": 0.0}
+            strike_map.setdefault(strike, {"callGex": 0.0, "putGex": 0.0})
             if opt_type == "C":
                 strike_map[strike]["callGex"] += gex_val
             elif opt_type == "P":
@@ -340,29 +315,24 @@ def calc_gex_for_ticker(item):
 
         if not strike_map:
             return None
-
         all_strikes = sorted(strike_map.keys())
-        upper_strikes = [k for k in all_strikes if k >= spot * 0.995] or all_strikes
-        lower_strikes = [k for k in all_strikes if k <= spot * 1.005] or all_strikes
-
-        call_wall = max(upper_strikes, key=lambda k: strike_map[k]["callGex"])
-        put_wall = min(lower_strikes, key=lambda k: strike_map[k]["putGex"])
+        upper = [k for k in all_strikes if k >= spot * 0.995] or all_strikes
+        lower = [k for k in all_strikes if k <= spot * 1.005] or all_strikes
+        call_wall = max(upper, key=lambda k: strike_map[k]["callGex"])
+        put_wall = min(lower, key=lambda k: strike_map[k]["putGex"])
         total_net_gex = sum(v["callGex"] + v["putGex"] for v in strike_map.values())
 
-        gamma_flip = round(spot, 1)
-        min_dist = float("inf")
+        gamma_flip, min_dist = round(spot, 1), float("inf")
         for i in range(len(all_strikes) - 1):
             s1, s2 = all_strikes[i], all_strikes[i + 1]
             n1 = strike_map[s1]["callGex"] + strike_map[s1]["putGex"]
             n2 = strike_map[s2]["callGex"] + strike_map[s2]["putGex"]
-            if (n1 <= 0 and n2 >= 0) or (n1 >= 0 and n2 <= 0):
+            if (n1 <= 0 <= n2) or (n1 >= 0 >= n2):
                 mid = (s1 + s2) / 2.0
                 if abs(mid - spot) < min_dist:
-                    min_dist = abs(mid - spot)
-                    gamma_flip = round(mid, 1)
+                    min_dist, gamma_flip = abs(mid - spot), round(mid, 1)
 
-        closest_strikes = sorted(all_strikes, key=lambda k: abs(k - spot))[:12]
-        closest_strikes.sort()
+        closest = sorted(sorted(all_strikes, key=lambda k: abs(k - spot))[:12])
         strikes_data = [
             {
                 "strike": round(k, 1),
@@ -370,9 +340,8 @@ def calc_gex_for_ticker(item):
                 "putGex": round(strike_map[k]["putGex"], 3),
                 "netGex": round(strike_map[k]["callGex"] + strike_map[k]["putGex"], 3)
             }
-            for k in closest_strikes
+            for k in closest
         ]
-
         unusual_list.sort(key=lambda x: x["_raw_prem"], reverse=True)
         top_flows = [{k: v for k, v in u.items() if k != "_raw_prem"} for u in unusual_list[:8]]
 
@@ -391,188 +360,177 @@ def calc_gex_for_ticker(item):
         print(f"[GEX Error] {symbol}: {e}")
         return None
 
-def fetch_live_market_news(extra_tickers):
-    base_syms = ["SPY", "QQQ", "NVDA", "TSLA", "SOXL", "AMD", "PLTR", "AVGO"] + extra_tickers
-    sym_query = ",".join(list(dict.fromkeys(base_syms))[:15])
-    rss_urls = [
-        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym_query}&region=US&lang=en-US",
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+def classify_news(title, desc, watch_set):
+    combined = f"{title} {desc}"
+    lower = combined.lower()
+    cat, score = "SECTOR", 2
+    if re.search(r"\b(fed|fomc|powell|cpi|pce|ppi|payroll|nonfarm|jobless|inflation|treasury|yield|tariff|trump|china|export|gdp)\b", combined, re.I):
+        cat, score = "MACRO", 7
+    elif re.search(r"\b(earnings|eps|revenue|guidance|forecast|q[1-4]|quarter|beats|misses|profit|margin|buyback|deliveries)\b", combined, re.I):
+        cat, score = "EARNINGS", 7
+    elif re.search(r"\b(upgrade[sd]?|downgrade[sd]?|price target|overweight|underweight|outperform|bofa|goldman|morgan stanley|jpmorgan|citi|wedbush|barclays)\b", combined, re.I):
+        cat, score = "RATING", 6
+
+    impact = "WATCH"
+    if re.search(r"\b(beat[s]?|surge[sd]?|jump[sd]?|rall(y|ies)|upgrade[sd]?|raises? |record|approval|wins?|buyback)\b", combined, re.I):
+        impact, score = "BULLISH", score + 2
+    elif re.search(r"\b(miss(es)?|cut[s]?|slash(es)?|downgrade[sd]?|plunge[sd]?|drop[s]?|tumble[sd]?|probe|lawsuit|tariff|curb|ban|delay|warn[s]?)\b", combined, re.I):
+        impact, score = "BEARISH", score + 2
+    elif cat == "MACRO":
+        impact, score = "VOLATILE", score + 2
+
+    matched = []
+    for w in re.findall(r"\b[A-Z]{2,5}\b", combined):
+        if (w in watch_set or w in KNOWN_TICKERS) and w not in matched:
+            matched.append(w)
+    for kw, tk in COMPANY_MAP.items():
+        if kw in lower and tk not in matched:
+            matched.append(tk)
+    tickers = matched[:4] if matched else ["MACRO"]
+    if any(t in watch_set for t in tickers):
+        score += 3
+    return cat, impact, tickers, score
+
+def mine_bilingual_trading_intel(watch_syms, gex_rows):
+    watch_set = set(watch_syms)
+    yf_syms = ",".join(list(dict.fromkeys(["SPY", "QQQ", "NVDA", "TSLA", "SOXL", "AMD"] + [s for s in watch_syms if s not in INDEX_YF_MAP]))[:12])
+    feeds = [
+        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"),
+        ("CNBC Markets", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+        ("CNBC Earnings", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135"),
+        ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
+        ("Yahoo Finance", f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={yf_syms}&region=US&lang=en-US"),
     ]
-    headlines = []
-    for url in rss_urls:
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    seen, candidates = set(), []
+
+    for src_name, url in feeds:
         try:
             resp = requests.get(url, headers=YF_HEADERS, timeout=12)
-            if resp.status_code == 200:
-                root = ET.fromstring(resp.content)
-                for item in root.findall(".//item")[:10]:
-                    title = item.findtext("title")
-                    if title and title not in headlines:
-                        headlines.append(title.strip())
-        except Exception:
-            pass
-    return headlines[:16]
+            if resp.status_code != 200:
+                continue
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:14]:
+                title = clean_html(item.findtext("title") or "")
+                link = (item.findtext("link") or "").strip()
+                desc = clean_html(item.findtext("description") or "")[:180]
+                pub_raw = item.findtext("pubDate") or ""
+                if len(title) < 18 or SPAM_PATTERN.search(title) or SPAM_PATTERN.search(link):
+                    continue
+                norm_k = re.sub(r"[^a-z0-9]", "", title.lower())[:42]
+                if norm_k in seen:
+                    continue
+                seen.add(norm_k)
 
-def call_free_ai_llm(prompt):
-    endpoints = []
-    if AI_API_KEY.startswith("gsk_"):
-        endpoints.append(("Groq", "https://api.groq.com/openai/v1/chat/completions", AI_API_KEY, "llama-3.3-70b-versatile"))
-    elif AI_API_KEY.startswith("sk-"):
-        endpoints.append(("OpenRouter", "https://openrouter.ai/api/v1/chat/completions", AI_API_KEY, "openai/gpt-4o-mini"))
-    if GITHUB_TOKEN:
-        endpoints.append(("GitHub Models (Azure)", "https://models.inference.ai.azure.com/chat/completions", GITHUB_TOKEN, "gpt-4o-mini"))
-        endpoints.append(("GitHub Models", "https://models.github.ai/inference/chat/completions", GITHUB_TOKEN, "openai/gpt-4o-mini"))
+                try:
+                    pub_dt = parsedate_to_datetime(pub_raw)
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=datetime.timezone.utc)
+                    age_h = max(0.0, (now_utc - pub_dt).total_seconds() / 3600.0)
+                except Exception:
+                    age_h = 2.0
+                if age_h > 48:
+                    continue
 
-    for label, url, token, model_name in endpoints:
-        try:
-            resp = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": "你是一位美股量化與期權策略師，請嚴格輸出純 JSON 格式（不含 Markdown 符號）。"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.3
-                },
-                timeout=30
-            )
-            if resp.status_code == 200:
-                content = resp.json()["choices"][0]["message"]["content"].strip()
-                if content.startswith("```"):
-                    content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                parsed = json.loads(content)
-                if parsed.get("summary") and parsed.get("tickers_consensus"):
-                    print(f"✅ 成功透過 {label} 生成今日 AI 市場報告！")
-                    return parsed
-        except Exception:
-            pass
-    return None
+                cat, impact, tickers, sc = classify_news(title, desc, watch_set)
+                bonus = 4 if age_h <= 3 else (2 if age_h <= 10 else 0)
+                candidates.append({
+                    "source": src_name, "title": title, "link": link, "desc": desc,
+                    "age_h": age_h, "category": cat, "impact": impact, "tickers": tickers, "score": sc + bonus
+                })
+        except Exception as e:
+            print(f"[Feed Warning] {src_name}: {e}")
 
-def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
-    utc_hour = datetime.datetime.utcnow().hour
-    session_type = "盤前簡報" if utc_hour < 13 else ("盤中快訊" if utc_hour < 20 else "盤後總結")
-    hk_time_str = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M HKT")
-
-    prompt = f"""
-請根據以下【{hk_time_str} 實時抓取的大盤與自選股 OBOS v2.1 數據（含三級牛熊政權與 EMA5 防死貓跳確認）、期權 GEX 點位與最新外電新聞】，生成繁體中文每日市場簡報與多空共識榜。
-
-【1. 大盤與自選標的 OBOS v2.1 數據】
-{json.dumps(market_rows, ensure_ascii=False)}
-
-【2. 期權 GEX 核心點位】
-{json.dumps([{k: v for k, v in r.items() if k != 'strikes_data'} for r in gex_rows], ensure_ascii=False)}
-
-【3. 最新華爾街實時新聞】
-{json.dumps(headlines, ensure_ascii=False)}
-
-請輸出純 JSON：
-{{
-  "summary": "300字內的繁體中文市場綜述：含外電焦點、SPX/NDX/SOX 的三級均線政權（牛市共振/年線上死叉/熊市）與 OBOS v2.1 進出場信號、以及 SPX/QQQ 的 Call/Put Wall 與 Gamma Flip 止盈止損應對策略。",
-  "tickers_consensus": [
-    {{
-      "ticker": "代碼",
-      "name": "名稱與現價",
-      "bullCount": 1到15整數,
-      "bearCount": 1到15整數,
-      "sector": "板塊或自選追蹤",
-      "keyTheme": "70字內的繁體中文新聞催化劑、OBOS v2.1 六色燈號狀態與期權關鍵支撐阻力位"
-    }}
-  ]
-}}
-"""
-    ai_res = call_free_ai_llm(prompt)
-    if ai_res:
-        return {
-            "session_type": session_type,
-            "summary": ai_res["summary"],
-            "tickers_consensus": ai_res["tickers_consensus"]
-        }
-
-    zh_headlines = [translate_to_zh_hk(h) for h in headlines[:3]]
-    top_news_zh = "；".join(zh_headlines) if zh_headlines else "市場聚焦美債收益率與科技股資金輪動"
-    spx_m = next((m for m in market_rows if m["symbol"] == "SPX"), {})
-    spx_g = next((g for g in gex_rows if g["symbol"] == "SPX"), {})
-
-    summary_text = (
-        f"【{hk_time_str} OBOS v2.1 實時研報】SPX 報 {spx_m.get('price', '--')} ({spx_m.get('change_pct', 0)}%，{spx_m.get('daily_signal', '')}，{spx_m.get('obos_level', '')})。"
-        f"SPX 期權 Call Wall {spx_g.get('call_wall', '--')} / Put Wall {spx_g.get('put_wall', '--')} / Gamma Flip {spx_g.get('gamma_flip', '--')} (Net GEX {spx_g.get('net_gex', 0)}B)。"
-        f"外電焦點：{top_news_zh}。"
-    )
-
+    candidates.sort(key=lambda x: (-x["score"], x["age_h"]))
+    top_items = candidates[:8]
     gex_lookup = {g["symbol"]: g for g in gex_rows}
-    consensus_list = []
-    for row in focus_rows[:10]:
-        tk = row["symbol"]
-        bull = max(2, min(13, 8 + (3 if row["change_pct"] >= 0 else -2) + (2 if "牛市共振" in row["daily_signal"] else -2)))
-        g_info = gex_lookup.get(tk)
-        g_txt = f"Call Wall ${g_info['call_wall']} / Put Wall ${g_info['put_wall']}" if g_info else row["daily_signal"]
-        consensus_list.append({
-            "ticker": tk,
-            "name": f"{row['name']} (${row['price']})",
-            "bullCount": bull,
-            "bearCount": 15 - bull,
-            "sector": "自選與核心追蹤",
-            "keyTheme": f"{row['obos_level']} · {g_txt}"
+
+    cards = []
+    for idx, it in enumerate(top_items):
+        tk0 = it["tickers"][0]
+        g_info = gex_lookup.get(tk0)
+        if it["desc"] and len(it["desc"]) > 25 and it["desc"].lower() != it["title"].lower():
+            take_en = it["desc"][:150]
+        elif g_info:
+            take_en = f"{tk0} Spot ${g_info['spot_price']}; watch Call Wall ${g_info['call_wall']} & Put Wall ${g_info['put_wall']} reaction."
+        else:
+            take_en = f"Monitor { '/'.join(it['tickers']) } volume reaction and EMA5 confirmation before entry."
+
+        mins = max(1, int(round(it["age_h"] * 60)))
+        time_ago = f"{mins}m" if mins < 60 else f"{max(1, mins // 60)}h"
+
+        cards.append({
+            "kind": "intel_v2",
+            "id": f"cron_{int(now_utc.timestamp())}_{idx}",
+            "category": it["category"],
+            "impact": it["impact"],
+            "tickers": it["tickers"],
+            "source": it["source"],
+            "timeAgo": time_ago,
+            "url": it["link"],
+            "title_en": it["title"],
+            "title_zh": translate_to_zh_hk(it["title"]),
+            "takeaway_en": take_en,
+            "takeaway_zh": translate_to_zh_hk(take_en)
         })
 
-    return {"session_type": session_type, "summary": summary_text, "tickers_consensus": consensus_list}
+    return cards
 
 def main():
-    existing_db_rows = fetch_custom_watchlist_from_db()
-    default_syms = {m["symbol"] for m in DEFAULT_MARKET_INDEXES}
-    custom_items = []
-    for r in existing_db_rows:
-        sym = (r.get("symbol") or "").strip().upper()
-        if sym and sym not in default_syms:
-            yf_sym = INDEX_YF_MAP.get(sym, urllib.parse.quote(sym.replace(".", "-")))
-            custom_items.append({"symbol": sym, "yf_ticker": yf_sym, "name": r.get("name") or sym})
+    # 1. 讀取資料庫現有清單（保留用戶在網頁端的新增與刪除結果）
+    db_market = fetch_table_rows("market_signals?select=symbol,name")
+    if db_market:
+        market_targets = [
+            {
+                "symbol": r["symbol"].strip().upper(),
+                "yf_ticker": INDEX_YF_MAP.get(r["symbol"].strip().upper(), urllib.parse.quote(r["symbol"].strip().upper().replace(".", "-"))),
+                "name": r.get("name") or r["symbol"]
+            }
+            for r in db_market if r.get("symbol")
+        ]
+    else:
+        market_targets = DEFAULT_MARKET_INDEXES
 
-    all_market_targets = DEFAULT_MARKET_INDEXES + custom_items
-    print(f"1. 正在更新 {len(all_market_targets)} 個大盤與自選標的 OBOS v2.1 信號...")
-    market_rows = []
-    for idx in all_market_targets:
-        res = calc_obos_v2_and_signals(idx)
-        if res:
-            market_rows.append(res)
-
+    print(f"1. 正在更新 {len(market_targets)} 個觀察標的 OBOS v2.1 信號...")
+    market_rows = [res for idx in market_targets if (res := calc_obos_v2_and_signals(idx))]
     if market_rows:
         r1 = requests.post(f"{SUPABASE_URL}/rest/v1/market_signals?on_conflict=symbol", headers=HEADERS, data=json.dumps(market_rows))
-        print(f"market_signals 寫入狀態: {r1.status_code}")
+        print(f"market_signals 狀態: {r1.status_code}")
 
-    default_gex_syms = {g["symbol"] for g in DEFAULT_GEX_TICKERS}
-    extra_gex_targets = [
-        {"symbol": c["symbol"], "cboe_ticker": INDEX_CBOE_MAP.get(c["symbol"], c["symbol"].replace("-", ""))}
-        for c in custom_items if c["symbol"] not in default_gex_syms and c["symbol"] not in NO_OPTION_SYMBOLS
-    ]
-    all_gex_targets = DEFAULT_GEX_TICKERS + extra_gex_targets
+    # 2. 讀取資料庫現有 GEX 清單（刪除過的代碼不再重新塞回）
+    db_gex = fetch_table_rows("options_gex?select=symbol")
+    gex_symbols = [r["symbol"].strip().upper() for r in db_gex if r.get("symbol")] if db_gex else DEFAULT_GEX_TICKERS
 
-    print(f"2. 正在計算 {len(all_gex_targets)} 個標的期權 GEX 與 Gamma Flip...")
-    gex_rows = []
-    for item in all_gex_targets:
-        gex_res = calc_gex_for_ticker(item)
-        if gex_res:
-            gex_rows.append(gex_res)
-
+    print(f"2. 正在計算 {len(gex_symbols)} 個期權標的 GEX: {gex_symbols}...")
+    gex_rows = [res for sym in gex_symbols if (res := calc_gex_for_symbol(sym))]
     if gex_rows:
         r2 = requests.post(f"{SUPABASE_URL}/rest/v1/options_gex?on_conflict=symbol", headers=HEADERS, data=json.dumps(gex_rows))
-        print(f"options_gex 寫入狀態: {r2.status_code}")
+        print(f"options_gex 狀態: {r2.status_code}")
 
-    print("3. 正在生成包含自選標的之每日 AI 簡報...")
-    custom_syms_only = [c["symbol"] for c in custom_items]
-    headlines = fetch_live_market_news(custom_syms_only)
+    # 3. 保留用戶釘選備忘，並更新雙語實戰交易情報
+    prev_rep = fetch_table_rows("daily_reports?select=tickers_consensus&order=created_at.desc&limit=1")
+    pinned_notes = []
+    if prev_rep and isinstance(prev_rep[0].get("tickers_consensus"), list):
+        pinned_notes = [x for x in prev_rep[0]["tickers_consensus"] if isinstance(x, dict) and x.get("timeAgo") == "Pinned"]
 
-    focus_rows = [m for m in market_rows if m["symbol"] not in default_syms]
-    for f_def in DEFAULT_FOCUS_STOCKS:
-        if not any(x["symbol"] == f_def["ticker"] for x in focus_rows):
-            res_f = calc_obos_v2_and_signals({"symbol": f_def["ticker"], "yf_ticker": f_def["ticker"], "name": f_def["name"]})
-            if res_f:
-                focus_rows.append(res_f)
+    all_watched = list(dict.fromkeys([m["symbol"] for m in market_rows] + gex_symbols))
+    intel_cards = mine_bilingual_trading_intel(all_watched, gex_rows)
 
-    report_payload = generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines)
-    if report_payload:
-        r3 = requests.post(f"{SUPABASE_URL}/rest/v1/daily_reports", headers=HEADERS, data=json.dumps(report_payload))
-        print(f"daily_reports 寫入狀態: {r3.status_code}")
+    utc_hour = datetime.datetime.utcnow().hour
+    session_type = "盤前簡報" if utc_hour < 13 else ("盤中快訊" if utc_hour < 20 else "盤後總結")
+
+    if intel_cards or pinned_notes:
+        r3 = requests.post(
+            f"{SUPABASE_URL}/rest/v1/daily_reports",
+            headers=HEADERS,
+            data=json.dumps({
+                "session_type": session_type,
+                "summary": "",
+                "tickers_consensus": pinned_notes + intel_cards
+            })
+        )
+        print(f"daily_reports 狀態: {r3.status_code}")
 
 if __name__ == "__main__":
     main()
