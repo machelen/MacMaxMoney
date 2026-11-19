@@ -3,7 +3,6 @@ import re
 import json
 import math
 import datetime
-import statistics
 import urllib.parse
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
@@ -41,7 +40,6 @@ INDEX_CBOE_MAP = {"SPX": "_SPX", "NDX": "_NDX", "VIX": "_VIX", "RUT": "_RUT"}
 NO_OPTION_SYMBOLS = {"DXY", "US10Y", "SOX"}
 OCC_PATTERN = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 NY_TZ = ZoneInfo("America/New_York")
-INV_SQRT_2PI = 0.3989422804014327
 
 SPAM_PATTERN = re.compile(
     r"fool\.com|investorplace|insidermonkey|gobankingrates|247wallst|zacks\.com|marketbeat|"
@@ -94,19 +92,6 @@ def translate_to_zh_hk(text):
         pass
     return text
 
-def fetch_live_spot_yf(symbol):
-    yf_sym = INDEX_YF_MAP.get(symbol, urllib.parse.quote(symbol.replace(".", "-")))
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
-        r = requests.get(url, headers=YF_HEADERS, timeout=10)
-        if r.status_code == 200:
-            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            if meta.get("regularMarketPrice"):
-                return float(meta["regularMarketPrice"])
-    except Exception:
-        pass
-    return None
-
 def fetch_yf_ohlcv(ticker_encoded, interval="1d", range_str="1y"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval={interval}&range={range_str}"
     resp = requests.get(url, headers=YF_HEADERS, timeout=15)
@@ -127,6 +112,19 @@ def fetch_yf_ohlcv(ticker_encoded, interval="1d", range_str="1y"):
         "volume": [v if v is not None else 0 for v in quote.get("volume", [])]
     }).dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     return df, meta
+
+def fetch_yf_live_spot(symbol):
+    try:
+        yf_sym = INDEX_YF_MAP.get(symbol, urllib.parse.quote(symbol.replace(".", "-")))
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
+        r = requests.get(url, headers=YF_HEADERS, timeout=8)
+        if r.status_code == 200:
+            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            if meta.get("regularMarketPrice"):
+                return float(meta["regularMarketPrice"])
+    except Exception:
+        pass
+    return None
 
 def calc_wilder_rsi_series(close_s, period=14):
     delta = close_s.diff()
@@ -160,17 +158,14 @@ def calc_obos_v2_and_signals(idx):
         close = df["close"]
         price = float(meta.get("regularMarketPrice") or close.iloc[-1])
         df.loc[df.index[-1], "close"] = price
-        df.loc[df.index[-1], "high"] = max(float(df["high"].iloc[-1]), price)
-        df.loc[df.index[-1], "low"] = min(float(df["low"].iloc[-1]), price)
-
         prev_close = float(close.iloc[-2])
         change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
-        ema5_s = close.ewm(span=5, adjust=False).mean()
+        ema5_s = df["close"].ewm(span=5, adjust=False).mean()
         ema5_now, ema5_prev = float(ema5_s.iloc[-1]), float(ema5_s.iloc[-2])
-        ema20_d = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50_d = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
-        ema200_d = float(close.ewm(span=min(200, len(close)), adjust=False).mean().iloc[-1])
+        ema20_d = float(df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50_d = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        ema200_d = float(df["close"].ewm(span=min(200, len(close)), adjust=False).mean().iloc[-1])
 
         if price >= ema200_d and ema20_d > ema50_d:
             os_thresh, ob_thresh, regime_tag = -60, 85, "牛市共振"
@@ -198,13 +193,13 @@ def calc_obos_v2_and_signals(idx):
         else:
             h4_signal = trend_tag
 
-        w_rsi = calc_wilder_rsi_series(close, 14)
+        w_rsi = calc_wilder_rsi_series(df["close"], 14)
         mfi_s = calc_mfi_series(df, 14).fillna(w_rsi)
         atr_s = calc_atr_series(df, 14).replace(0, 1.0)
-        ma20_s = close.rolling(20).mean().bfill()
-        std20_s = close.rolling(20).std().replace(0, 1.0).bfill().fillna(1.0)
+        ma20_s = df["close"].rolling(20).mean().bfill()
+        std20_s = df["close"].rolling(20).std().replace(0, 1.0).bfill().fillna(1.0)
 
-        z_s = (close - ma20_s) / std20_s
+        z_s = (df["close"] - ma20_s) / std20_s
         damper_s = (std20_s / (1.5 * atr_s)).clip(0.5, 1.0)
         obos_series = ((0.6 * w_rsi + 0.4 * mfi_s - 50.0) * 1.2 + (z_s * 20.0).clip(-50.0, 50.0) * damper_s).fillna(0.0).round().clip(-100, 100)
 
@@ -252,21 +247,49 @@ def calc_obos_v2_and_signals(idx):
         print(f"[Market Error] {idx['symbol']}: {e}")
         return None
 
-def bsm_gamma_scalar(S, K, T, fwd_ratio, sigma):
+def get_cboe_valuation_clock(now_et):
+    wk = now_et.weekday()  # 0=Mon .. 6=Sun
+    mins = now_et.hour * 60 + now_et.minute
+    today_str = now_et.strftime("%Y-%m-%d")
+    tomorrow_str = (now_et.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    is_weekday = wk <= 4
+
+    min_session_date = today_str if (is_weekday and mins < 16 * 60) else tomorrow_str
+
+    if is_weekday and (9 * 60 + 45) <= mins < (16 * 60 + 15):
+        quote_val_et = now_et - datetime.timedelta(minutes=15)
+    elif is_weekday and mins >= (16 * 60 + 15):
+        quote_val_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    else:
+        back_days = 3 if wk == 0 else (2 if wk == 6 else 1)
+        prev_day = now_et.date() - datetime.timedelta(days=back_days)
+        quote_val_et = datetime.datetime(prev_day.year, prev_day.month, prev_day.day, 16, 0, 0, tzinfo=NY_TZ)
+
+    return min_session_date, quote_val_et
+
+def bsm_gamma_scalar(S, K, T, r, sigma, fwd_ratio=1.0):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    sig_sqrt_t = sigma * math.sqrt(T)
-    d1 = (math.log((S * fwd_ratio) / K) + 0.5 * sigma * sigma * T) / sig_sqrt_t
-    pdf = INV_SQRT_2PI * math.exp(-0.5 * d1 * d1)
-    return pdf / (S * sig_sqrt_t)
+    sqrt_t = math.sqrt(T)
+    ln_fwd = math.log(max(fwd_ratio, 0.5))
+    discount_q = math.exp(-r * T) * fwd_ratio
+    d1 = (math.log(S / K) + ln_fwd + 0.5 * sigma * sigma * T) / (sigma * sqrt_t)
+    pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    return (discount_q * pdf) / (S * sigma * sqrt_t)
+
+def interp_skew_iv(strike, pts_k, pts_iv, fallback_iv):
+    if len(pts_k) == 0:
+        return fallback_iv
+    return float(np.interp(strike, pts_k, pts_iv))
 
 def calc_gex_for_symbol(symbol, live_spot_hint=None):
-    """機構級「下一交易場次單一到期日」GEX 運算引擎 (Put-Call Parity 偏度配對 + T_eff 反推校準 + 實時現價重定價)"""
+    """機構級單一場次 GEX：同步估值時鐘 + Put-Call Parity 遠期率 + 偏度插值 + PM 合約隔離 + 零假邊界求根"""
     if symbol in NO_OPTION_SYMBOLS:
         return None
     cboe_ticker = INDEX_CBOE_MAP.get(symbol, re.sub(r"[^A-Z0-9]", "", symbol))
     clean_root = re.sub(r"[^A-Z]", "", symbol)
     valid_roots = {clean_root, f"{clean_root}W", f"{clean_root}P"}
+    is_am_pm_index = symbol in {"SPX", "NDX", "RUT"}
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_ticker}.json"
 
     try:
@@ -279,17 +302,12 @@ def calc_gex_for_symbol(symbol, live_spot_hint=None):
         if cboe_spot <= 0 or not options:
             return None
 
-        active_spot = (
-            float(live_spot_hint)
-            if (live_spot_hint and live_spot_hint > 0 and abs(live_spot_hint - cboe_spot) / cboe_spot <= 0.15)
-            else cboe_spot
-        )
+        if live_spot_hint is None:
+            live_spot_hint = fetch_yf_live_spot(symbol)
+        eval_spot = float(live_spot_hint) if (live_spot_hint and abs(live_spot_hint - cboe_spot) / cboe_spot < 0.20) else cboe_spot
 
         now_et = datetime.datetime.now(NY_TZ)
-        today_et_str = now_et.strftime("%Y-%m-%d")
-        tomorrow_et_str = (now_et.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        mins_et = now_et.hour * 60 + now_et.minute
-        min_session_date = tomorrow_et_str if mins_et >= 16 * 60 else today_et_str
+        min_session_date, quote_val_et = get_cboe_valuation_clock(now_et)
 
         parsed_all = []
         unusual_list = []
@@ -314,18 +332,17 @@ def calc_gex_for_symbol(symbol, live_spot_hint=None):
             cboe_gamma = float(opt.get("gamma") or 0.0)
             bid = float(opt.get("bid") or 0.0)
             ask = float(opt.get("ask") or 0.0)
-            mid_p = 0.5 * (bid + ask) if (bid > 0 and ask > 0) else (bid or ask or 0.0)
-            last_p = float(opt.get("last_trade_price") or mid_p)
+            last_p = float(opt.get("last_trade_price") or 0.0)
+            mid_p = 0.5 * (bid + ask) if (bid > 0 and ask > 0) else (last_p or ask or bid or 0.0)
 
             parsed_all.append({
                 "root": root, "exp_str": exp_str, "opt_type": opt_type,
-                "strike": strike, "oi": oi, "vol": vol, "iv": iv,
-                "cboe_gamma": cboe_gamma, "bid": bid, "ask": ask
+                "strike": strike, "oi": oi, "vol": vol, "iv": iv, "cboe_gamma": cboe_gamma, "mid_p": mid_p
             })
 
             days_diff = (datetime.date.fromisoformat(exp_str) - datetime.date.fromisoformat(min_session_date)).days
-            premium = vol * last_p * 100.0
-            if days_diff <= 14 and abs(strike - active_spot) / active_spot <= 0.20 and vol >= 300 and oi > 0 and (vol / oi) >= 1.4 and premium >= 100000:
+            premium = vol * (last_p or mid_p) * 100.0
+            if days_diff <= 14 and abs(strike - eval_spot) / eval_spot <= 0.15 and vol >= 300 and oi > 0 and (vol / oi) >= 1.4 and premium >= 100000:
                 unusual_list.append({
                     "time": now_et.strftime("%H:%M"),
                     "ticker": symbol,
@@ -342,195 +359,165 @@ def calc_gex_for_symbol(symbol, live_spot_hint=None):
             return None
 
         target_exp = sorted({c["exp_str"] for c in active_with_oi})[0]
-        valid_chain = [c for c in parsed_all if c["exp_str"] == target_exp and (c["oi"] > 0 or 0.02 <= c["iv"] <= 4.0) and abs(c["strike"] - active_spot) / active_spot <= 0.40]
+        session_chain = [c for c in active_with_oi if c["exp_str"] == target_exp and abs(c["strike"] - eval_spot) / eval_spot <= 0.30]
 
-        # 月結算日鎖定當日場次時，自動剔除已於前一日 16:00 ET 停止交易之標準 AM 合約
-        if target_exp == min_session_date:
-            if any(c["root"].endswith(("W", "P")) and c["oi"] > 0 for c in valid_chain):
-                valid_chain = [c for c in valid_chain if c["root"].endswith(("W", "P"))]
-        if not any(c["oi"] > 0 for c in valid_chain):
+        if is_am_pm_index:
+            pm_only = [c for c in session_chain if c["root"].endswith(("W", "P"))]
+            if pm_only:
+                session_chain = pm_only
+        if not session_chain:
             return None
 
-        raw_by_strike = {}
-        for c in valid_chain:
-            node = raw_by_strike.setdefault(c["strike"], {
-                "callOi": 0.0, "putOi": 0.0, "callIv": 0.0, "putIv": 0.0,
-                "callGamma": 0.0, "putGamma": 0.0, "callMid": 0.0, "putMid": 0.0
+        exp_dt_et = datetime.datetime.fromisoformat(f"{target_exp}T16:00:00").replace(tzinfo=NY_TZ)
+        mins_left = max(15.0, (exp_dt_et - quote_val_et).total_seconds() / 60.0)
+        T = mins_left / 525600.0
+        R_RATE = 0.043
+
+        # Put-Call Parity 萃取市場真實隱含遠期比 fwd_ratio = F0 / cboe_spot
+        parity_map = {}
+        for c in session_chain:
+            if c["mid_p"] > 0 and abs(c["strike"] - cboe_spot) / cboe_spot <= 0.03:
+                parity_map.setdefault(c["strike"], {})[c["opt_type"]] = c["mid_p"]
+        fwd_ratios = sorted(
+            (k + math.exp(R_RATE * T) * (v["C"] - v["P"])) / cboe_spot
+            for k, v in parity_map.items() if "C" in v and "P" in v
+        )
+        fwd_ratios = [r for r in fwd_ratios if 0.97 <= r <= 1.03]
+        fwd_ratio = fwd_ratios[len(fwd_ratios) // 2] if fwd_ratios else 1.0
+
+        near_ivs = sorted(c["iv"] for c in session_chain if 0.01 < c["iv"] < 5.0 and abs(c["strike"] - cboe_spot) / cboe_spot <= 0.05)
+        atm_iv = near_ivs[len(near_ivs) // 2] if near_ivs else 0.20
+
+        call_pts = sorted((c["strike"], c["iv"]) for c in session_chain if c["opt_type"] == "C" and 0.01 < c["iv"] < 5.0)
+        put_pts = sorted((c["strike"], c["iv"]) for c in session_chain if c["opt_type"] == "P" and 0.01 < c["iv"] < 5.0)
+        call_k, call_iv = ([p[0] for p in call_pts], [p[1] for p in call_pts]) if call_pts else ([], [])
+        put_k, put_iv = ([p[0] for p in put_pts], [p[1] for p in put_pts]) if put_pts else ([], [])
+
+        strike_map = {}
+        book_K, book_oi, book_sigma, book_anchor, book_sign = [], [], [], [], []
+
+        for c in session_chain:
+            sigma = c["iv"] if (0.01 < c["iv"] < 5.0) else (
+                interp_skew_iv(c["strike"], call_k, call_iv, atm_iv) if c["opt_type"] == "C"
+                else interp_skew_iv(c["strike"], put_k, put_iv, atm_iv)
+            )
+            g_model_cboe = bsm_gamma_scalar(cboe_spot, c["strike"], T, R_RATE, sigma, fwd_ratio)
+            anchor = float(np.clip(c["cboe_gamma"] / g_model_cboe, 0.85, 1.15)) if (c["cboe_gamma"] >= 0.0005 and g_model_cboe >= 0.0005) else 1.0
+
+            gamma_eval = anchor * bsm_gamma_scalar(eval_spot, c["strike"], T, R_RATE, sigma, fwd_ratio)
+            gex_val = gamma_eval * c["oi"] * 100.0 * (eval_spot ** 2) * 0.01 / 1e9
+
+            st = strike_map.setdefault(c["strike"], {
+                "callGex": 0.0, "putGex": 0.0, "callOi": 0.0, "putOi": 0.0, "callIvSum": 0.0, "putIvSum": 0.0
             })
             if c["opt_type"] == "C":
-                node["callOi"] += c["oi"]
-                if 0.02 <= c["iv"] <= 4.0:
-                    node["callIv"] = c["iv"]
-                if c["cboe_gamma"] > node["callGamma"]:
-                    node["callGamma"] = c["cboe_gamma"]
-                if c["bid"] > 0 and c["ask"] > 0:
-                    node["callMid"] = 0.5 * (c["bid"] + c["ask"])
+                st["callGex"] += gex_val
+                st["callOi"] += c["oi"]
+                st["callIvSum"] += sigma * c["oi"]
             else:
-                node["putOi"] += c["oi"]
-                if 0.02 <= c["iv"] <= 4.0:
-                    node["putIv"] = c["iv"]
-                if c["cboe_gamma"] > node["putGamma"]:
-                    node["putGamma"] = c["cboe_gamma"]
-                if c["bid"] > 0 and c["ask"] > 0:
-                    node["putMid"] = 0.5 * (c["bid"] + c["ask"])
+                st["putGex"] -= gex_val
+                st["putOi"] += c["oi"]
+                st["putIvSum"] += sigma * c["oi"]
 
-        sorted_strikes = sorted(raw_by_strike.keys())
-        atm_iv_cands = []
-        for k in sorted_strikes:
-            if abs(k - cboe_spot) / cboe_spot <= 0.04:
-                n = raw_by_strike[k]
-                civ = (n["putIv"] or n["callIv"]) if k < cboe_spot else (n["callIv"] or n["putIv"])
-                if 0.02 <= civ <= 4.0:
-                    atm_iv_cands.append(civ)
-        atm_iv = statistics.median(atm_iv_cands) if atm_iv_cands else 0.20
+            book_K.append(c["strike"])
+            book_oi.append(c["oi"])
+            book_sigma.append(sigma)
+            book_anchor.append(anchor)
+            book_sign.append(1.0 if c["opt_type"] == "C" else -1.0)
 
-        known_pts = []
-        for k in sorted_strikes:
-            n = raw_by_strike[k]
-            pref = (n["putIv"] or n["callIv"]) if k < cboe_spot else (n["callIv"] or n["putIv"])
-            if 0.02 <= pref <= 4.0:
-                n["sigma"] = pref
-                known_pts.append((k, pref))
-            else:
-                n["sigma"] = 0.0
+        all_strikes = sorted(strike_map.keys())
+        wall_pool = [k for k in all_strikes if abs(k - eval_spot) / eval_spot <= 0.15] or all_strikes
 
-        for k in sorted_strikes:
-            n = raw_by_strike[k]
-            if n["sigma"] > 0:
-                continue
-            if not known_pts:
-                n["sigma"] = atm_iv
-                continue
-            left = next((pt for pt in reversed(known_pts) if pt[0] < k), None)
-            right = next((pt for pt in known_pts if pt[0] > k), None)
-            if left and right:
-                w = (k - left[0]) / (right[0] - left[0])
-                n["sigma"] = left[1] + w * (right[1] - left[1])
-            elif left:
-                n["sigma"] = left[1]
-            else:
-                n["sigma"] = right[1]
-
-        exp_dt_et = datetime.datetime.fromisoformat(f"{target_exp}T16:00:00").replace(tzinfo=NY_TZ)
-        hours_left = max(0.25, (exp_dt_et - now_et).total_seconds() / 3600.0)
-        T_cal = hours_left / (365.0 * 24.0)
-        R_RATE = 0.043
-        fwd_ratio = math.exp((R_RATE - 0.012) * T_cal)
-
-        parity_strikes = sorted(
-            [k for k in sorted_strikes if abs(k - cboe_spot) / cboe_spot <= 0.02 and raw_by_strike[k]["callMid"] > 0 and raw_by_strike[k]["putMid"] > 0],
-            key=lambda x: abs(x - cboe_spot)
-        )
-        if parity_strikes:
-            k0 = parity_strikes[0]
-            imp_f = k0 + math.exp(R_RATE * T_cal) * (raw_by_strike[k0]["callMid"] - raw_by_strike[k0]["putMid"])
-            if imp_f > 0 and abs(imp_f - cboe_spot) / cboe_spot <= 0.03:
-                fwd_ratio = imp_f / cboe_spot
-
-        t_samples = []
-        for k in sorted_strikes:
-            if abs(k - cboe_spot) / cboe_spot > 0.018:
-                continue
-            n = raw_by_strike[k]
-            ref_g = n["putGamma"] if k < cboe_spot else n["callGamma"]
-            ref_iv = n["putIv"] if k < cboe_spot else n["callIv"]
-            if ref_g >= 0.0015 and 0.02 <= ref_iv <= 3.0:
-                sqrt_t = INV_SQRT_2PI / (cboe_spot * ref_iv * ref_g)
-                for _ in range(2):
-                    t_est = sqrt_t * sqrt_t
-                    d1 = (math.log((cboe_spot * fwd_ratio) / k) + 0.5 * ref_iv * ref_iv * t_est) / (ref_iv * sqrt_t)
-                    pdf = INV_SQRT_2PI * math.exp(-0.5 * d1 * d1)
-                    sqrt_t = pdf / (cboe_spot * ref_iv * ref_g)
-                t_val = sqrt_t * sqrt_t
-                if math.isfinite(t_val) and t_val > 0:
-                    t_samples.append(t_val)
-
-        T_eff = max(T_cal * 0.15, min(T_cal * 4.5, statistics.median(t_samples))) if len(t_samples) >= 2 else T_cal
-
-        active_strikes = [k for k in sorted_strikes if raw_by_strike[k]["callOi"] > 0 or raw_by_strike[k]["putOi"] > 0]
-        strike_map = {}
-        scale_now = 100.0 * (active_spot ** 2) * 0.01 / 1e9
-
-        for k in active_strikes:
-            n = raw_by_strike[k]
-            g = bsm_gamma_scalar(active_spot, k, T_eff, fwd_ratio, n["sigma"])
-            strike_map[k] = {
-                "callGex": g * n["callOi"] * scale_now,
-                "putGex": -(g * n["putOi"] * scale_now),
-                "netOi": n["callOi"] - n["putOi"],
-                "sigma": n["sigma"]
-            }
-
-        wall_pool = [k for k in active_strikes if abs(k - active_spot) / active_spot <= 0.30] or active_strikes
         call_wall = max(wall_pool, key=lambda k: strike_map[k]["callGex"])
         put_wall = min(wall_pool, key=lambda k: strike_map[k]["putGex"])
         total_net_gex = sum(v["callGex"] + v["putGex"] for v in strike_map.values())
 
-        arr_K = np.array(active_strikes, dtype=float)
-        arr_sig = np.array([strike_map[k]["sigma"] for k in active_strikes], dtype=float)
-        arr_net_oi = np.array([strike_map[k]["netOi"] for k in active_strikes], dtype=float)
-        sqrt_T = math.sqrt(T_eff)
+        arr_K = np.array(book_K, dtype=float)
+        arr_oi = np.array(book_oi, dtype=float)
+        arr_sig = np.array(book_sigma, dtype=float)
+        arr_anc = np.array(book_anchor, dtype=float)
+        arr_sgn = np.array(book_sign, dtype=float)
+        sqrt_T = math.sqrt(T)
+        ln_fwd = math.log(max(fwd_ratio, 0.5))
+        discount_q = math.exp(-R_RATE * T) * fwd_ratio
 
         def net_gex_at_hyp_spot(hyp_s):
-            d1 = (np.log((hyp_s * fwd_ratio) / arr_K) + 0.5 * (arr_sig ** 2) * T_eff) / (arr_sig * sqrt_T)
-            gammas = INV_SQRT_2PI * np.exp(-0.5 * (d1 ** 2)) / (hyp_s * arr_sig * sqrt_T)
-            return float(np.sum(arr_net_oi * gammas) * 100.0 * (hyp_s ** 2) * 0.01 / 1e9)
+            d1 = (np.log(hyp_s / arr_K) + ln_fwd + 0.5 * arr_sig ** 2 * T) / (arr_sig * sqrt_T)
+            pdf = np.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
+            gammas = arr_anc * (discount_q * pdf) / (hyp_s * arr_sig * sqrt_T)
+            return float(np.sum(arr_sgn * gammas * arr_oi) * 100.0 * (hyp_s ** 2) * 0.01 / 1e9)
 
-        grid_s = np.linspace(active_spot * 0.80, active_spot * 1.20, 161)
-        grid_g = [net_gex_at_hyp_spot(float(s)) for s in grid_s]
-
-        best_bracket = None
-        min_dist = float("inf")
-        for i in range(len(grid_s) - 1):
-            g1, g2 = grid_g[i], grid_g[i + 1]
-            if ((g1 < 0 and g2 >= 0) or (g1 > 0 and g2 <= 0)) and (abs(g1) + abs(g2) > 1e-9):
-                mid = 0.5 * (grid_s[i] + grid_s[i + 1])
-                if abs(mid - active_spot) < min_dist:
-                    min_dist = abs(mid - active_spot)
-                    best_bracket = (float(grid_s[i]), float(grid_s[i + 1]), g1)
-
+        scan_min = max(all_strikes[0], eval_spot * 0.75)
+        scan_max = min(all_strikes[-1], eval_spot * 1.25)
         gamma_flip = 0.0
-        if best_bracket:
-            lo, hi, g_lo = best_bracket
-            for _ in range(14):
-                mid = 0.5 * (lo + hi)
-                g_mid = net_gex_at_hyp_spot(mid)
-                if (g_lo <= 0 and g_mid <= 0) or (g_lo >= 0 and g_mid >= 0):
-                    lo, g_lo = mid, g_mid
-                else:
-                    hi = mid
-            gamma_flip = round(0.5 * (lo + hi), 2)
 
-        near_set = set(sorted(wall_pool, key=lambda k: abs(k - active_spot))[:12])
+        if scan_max > scan_min:
+            grid_s = np.linspace(scan_min, scan_max, 141)
+            grid_g = [net_gex_at_hyp_spot(float(s)) for s in grid_s]
+            best_bracket, min_dist = None, float("inf")
+            for i in range(len(grid_s) - 1):
+                g1, g2 = grid_g[i], grid_g[i + 1]
+                if ((g1 <= 0 <= g2) or (g1 >= 0 >= g2)) and (abs(g1) + abs(g2) > 1e-9):
+                    mid = 0.5 * (grid_s[i] + grid_s[i + 1])
+                    if abs(mid - eval_spot) < min_dist:
+                        min_dist = abs(mid - eval_spot)
+                        best_bracket = (float(grid_s[i]), float(grid_s[i + 1]), g1)
+
+            if best_bracket:
+                lo, hi, g_lo = best_bracket
+                for _ in range(14):
+                    mid = 0.5 * (lo + hi)
+                    g_mid = net_gex_at_hyp_spot(mid)
+                    if (g_lo <= 0 and g_mid <= 0) or (g_lo >= 0 and g_mid >= 0):
+                        lo, g_lo = mid, g_mid
+                    else:
+                        hi = mid
+                gamma_flip = round(0.5 * (lo + hi), 2)
+
+        curve_pts = [
+            [round(float(s), 2), round(net_gex_at_hyp_spot(float(s)), 5)]
+            for s in np.linspace(eval_spot * 0.90, eval_spot * 1.10, 25)
+        ]
+        if eval_spot * 0.90 <= gamma_flip <= eval_spot * 1.10 and gamma_flip > 0:
+            curve_pts.append([gamma_flip, 0.0])
+            curve_pts.sort(key=lambda x: x[0])
+
+        near_set = set(sorted(wall_pool, key=lambda k: abs(k - eval_spot))[:12])
         near_set.update([call_wall, put_wall])
         display_strikes = sorted(near_set)
 
-        strikes_data = [
-            {
+        strikes_data = []
+        for idx, k in enumerate(display_strikes):
+            st = strike_map[k]
+            c_iv = st["callIvSum"] / st["callOi"] if st["callOi"] > 0 else atm_iv
+            p_iv = st["putIvSum"] / st["putOi"] if st["putOi"] > 0 else atm_iv
+            row_obj = {
                 "strike": round(k, 2),
-                "callGex": round(strike_map[k]["callGex"], 5),
-                "putGex": round(strike_map[k]["putGex"], 5),
-                "netGex": round(strike_map[k]["callGex"] + strike_map[k]["putGex"], 5),
-                "sigma": round(strike_map[k]["sigma"], 4),
-                "T": round(T_eff, 6),
-                "fwdRatio": round(fwd_ratio, 6),
+                "callGex": round(st["callGex"], 6),
+                "putGex": round(st["putGex"], 6),
+                "netGex": round(st["callGex"] + st["putGex"], 6),
+                "callIv": round(c_iv, 4),
+                "putIv": round(p_iv, 4),
+                "fwdRatio": round(fwd_ratio, 5),
+                "T": round(T, 6),
                 "exp": target_exp
             }
-            for k in display_strikes
-        ]
+            if idx == 0:
+                row_obj["curve"] = curve_pts
+            strikes_data.append(row_obj)
 
         unusual_list.sort(key=lambda x: x["_raw_prem"], reverse=True)
         top_flows = [{k: v for k, v in u.items() if k != "_raw_prem"} for u in unusual_list[:8]]
 
-        print(f" - [{symbol}] Exp={target_exp}, Spot={active_spot}, CW={call_wall}, PW={put_wall}, Flip={gamma_flip}, NetGEX={round(total_net_gex,4)}B")
+        print(f" - [{symbol}] Exp={target_exp}, Spot={eval_spot} (CBOE={cboe_spot}), CW={call_wall}, PW={put_wall}, Flip={gamma_flip}, NetGEX={round(total_net_gex,4)}B")
 
         return {
             "symbol": symbol,
-            "spot_price": round(active_spot, 2),
+            "spot_price": round(eval_spot, 2),
             "call_wall": round(call_wall, 2),
             "put_wall": round(put_wall, 2),
             "gamma_flip": gamma_flip,
-            "net_gex": round(total_net_gex, 4),
+            "net_gex": round(total_net_gex, 5),
             "strikes_data": strikes_data,
             "unusual_flows": top_flows,
             "updated_at": datetime.datetime.utcnow().isoformat()
@@ -675,19 +662,13 @@ def main():
         r1 = requests.post(f"{SUPABASE_URL}/rest/v1/market_signals?on_conflict=symbol", headers=HEADERS, data=json.dumps(market_rows))
         print(f"market_signals 狀態: {r1.status_code}")
 
-    spot_lookup = {m["symbol"]: m["price"] for m in market_rows}
+    live_price_map = {m["symbol"]: m["price"] for m in market_rows}
 
     db_gex = fetch_table_rows("options_gex?select=symbol")
     gex_symbols = [r["symbol"].strip().upper() for r in db_gex if r.get("symbol")] if db_gex else DEFAULT_GEX_TICKERS
 
-    print(f"2. 正在計算 {len(gex_symbols)} 個期權標的「下一場次」校準 GEX: {gex_symbols}...")
-    gex_rows = []
-    for sym in gex_symbols:
-        live_p = spot_lookup.get(sym) or fetch_live_spot_yf(sym)
-        res = calc_gex_for_symbol(sym, live_p)
-        if res:
-            gex_rows.append(res)
-
+    print(f"2. 正在計算 {len(gex_symbols)} 個期權標的「下一場次」精準 GEX: {gex_symbols}...")
+    gex_rows = [res for sym in gex_symbols if (res := calc_gex_for_symbol(sym, live_price_map.get(sym)))]
     if gex_rows:
         r2 = requests.post(f"{SUPABASE_URL}/rest/v1/options_gex?on_conflict=symbol", headers=HEADERS, data=json.dumps(gex_rows))
         print(f"options_gex 狀態: {r2.status_code}")
