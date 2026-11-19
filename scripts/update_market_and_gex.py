@@ -146,21 +146,41 @@ def calc_obos_v2_and_signals(idx):
         prev_close = float(close.iloc[-2])
         change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close != 0 else 0.0
 
+        # 計算 EMA5, EMA20, EMA50, EMA200
+        ema5_s = close.ewm(span=5, adjust=False).mean()
+        ema5_now = float(ema5_s.iloc[-1])
+        ema5_prev = float(ema5_s.iloc[-2])
         ema20_d = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
         ema50_d = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200_d = float(close.ewm(span=min(200, len(close)), adjust=False).mean().iloc[-1])
-        is_bull = price >= ema200_d
+
+        is_above_200 = price >= ema200_d
+        is_mid_bull = ema20_d > ema50_d
+
+        # 三級牛熊動態門檻（防破年線前夕門檻滯後）
+        if is_above_200 and is_mid_bull:
+            os_thresh = -60
+            ob_thresh = 85
+            regime_tag = "牛市共振"
+        elif is_above_200 and not is_mid_bull:
+            os_thresh = -75
+            ob_thresh = 75
+            regime_tag = "年線上死叉"
+        else:
+            os_thresh = -85
+            ob_thresh = 60
+            regime_tag = "熊市(<EMA200)"
 
         if price > ema20_d and ema20_d > ema50_d:
             trend_tag = "多頭趨勢"
         elif price < ema20_d and ema20_d < ema50_d:
             trend_tag = "空頭承壓"
-        elif price > ema20_d:
-            trend_tag = "反彈修復"
+        elif price >= ema5_now:
+            trend_tag = "站上EMA5"
         else:
             trend_tag = "震盪整理"
 
-        daily_signal = f"{'牛市(>EMA200)' if is_bull else '熊市(<EMA200)'}·{trend_tag}"
+        daily_signal = f"{regime_tag}·{trend_tag}"
 
         if not df_1h.empty and len(df_1h) >= 40:
             close_4h = df_1h["close"].iloc[::4].reset_index(drop=True)
@@ -175,7 +195,7 @@ def calc_obos_v2_and_signals(idx):
         else:
             h4_signal = trend_tag
 
-        # OBOS v2.0 序列運算
+        # OBOS v2.1 序列運算
         w_rsi = calc_wilder_rsi_series(close, 14)
         mfi_s = calc_mfi_series(df, 14).fillna(w_rsi)
         atr_s = calc_atr_series(df, 14).replace(0, 1.0)
@@ -188,30 +208,36 @@ def calc_obos_v2_and_signals(idx):
         bb_v2 = (z_s * 20.0).clip(-50.0, 50.0) * damper_s
         obos_series = (mom_v2 + bb_v2).fillna(0.0).round().clip(-100, 100)
 
+        obos_3 = int(obos_series.iloc[-3])
         obos_prev = int(obos_series.iloc[-2])
         obos_now = int(obos_series.iloc[-1])
-
-        os_thresh = -60 if is_bull else -85
-        ob_thresh = 85 if is_bull else 60
         last_open = float(df["open"].iloc[-1])
 
-        # 六色閉環實戰燈號判定（含右側買賣點、動能減速止盈、破底失效止損、極值觀察）
-        if obos_prev <= os_thresh and obos_now > obos_prev and price >= last_open:
-            obos_level = f"🟢 右側買點觸發 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
-        elif obos_prev >= ob_thresh and obos_now < obos_prev and price <= last_open:
-            obos_level = f"🔴 右側賣點觸發 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
-        elif 45 <= obos_prev < ob_thresh and (obos_prev - obos_now) >= 12 and price < last_open:
+        # EMA5 防死貓跳確認邏輯（支援當日直接站上 EMA5，或超賣勾頭後第 2-3 日補站上 EMA5 觸發）
+        above_ema5 = price >= ema5_now
+        just_reclaimed_ema5 = (prev_close < ema5_prev) and above_ema5
+        recent_oversold = min(obos_prev, obos_3) <= os_thresh
+        direct_buy = (obos_prev <= os_thresh) and (obos_now > obos_prev) and (price >= last_open) and above_ema5
+        delayed_buy = recent_oversold and just_reclaimed_ema5 and (obos_now > obos_prev) and (obos_now < 25) and (price >= last_open)
+
+        if direct_buy or delayed_buy:
+            obos_level = f"🟢 右側買點 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)}·站穩EMA5)"
+        elif (obos_prev <= os_thresh) and (obos_now > obos_prev) and (price >= last_open) and (not above_ema5):
+            obos_level = "🟡 勾頭未過EMA5 (防死貓跳)"
+        elif (obos_prev >= ob_thresh) and (obos_now < obos_prev) and (price <= last_open):
+            obos_level = f"🔴 右側賣點 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
+        elif 45 <= obos_prev < ob_thresh and (obos_prev - obos_now) >= 12 and (price < last_open):
             obos_level = f"🟣 動能減速止盈 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
-        elif obos_now <= -40 and (obos_now - obos_prev) <= -10 and price < ema20_d and price < last_open:
+        elif (obos_now <= -40) and ((obos_now - obos_prev) <= -10) and (price < ema20_d) and (price < last_open):
             obos_level = f"🚨 破底失效止損 ({fmt_signed(obos_prev)}→{fmt_signed(obos_now)})"
         elif obos_now <= os_thresh:
             obos_level = f"🟡 超賣觀察中 (門檻{os_thresh})"
         elif obos_now >= ob_thresh:
             obos_level = f"🟠 超買觀察中 (門檻+{ob_thresh})"
         elif obos_now >= 35:
-            obos_level = f"偏強推進 (止盈警戒+45/+{ob_thresh})"
+            obos_level = f"偏強推進 (門檻+{ob_thresh})"
         elif obos_now <= -35:
-            obos_level = f"偏弱整理 (買點門檻{os_thresh})"
+            obos_level = f"偏弱整理 (門檻{os_thresh})"
         else:
             obos_level = f"中性區間 (門檻{os_thresh}/+{ob_thresh})"
 
@@ -429,9 +455,9 @@ def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
     hk_time_str = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M HKT")
 
     prompt = f"""
-請根據以下【{hk_time_str} 實時抓取的大盤與自選股 OBOS v2.0 六色燈號數據、期權 GEX 點位與最新外電新聞】，生成繁體中文每日市場簡報與多空共識榜（務必涵蓋用戶自選觀察標的）。
+請根據以下【{hk_time_str} 實時抓取的大盤與自選股 OBOS v2.1 數據（含三級牛熊政權與 EMA5 防死貓跳確認）、期權 GEX 點位與最新外電新聞】，生成繁體中文每日市場簡報與多空共識榜。
 
-【1. 大盤與自選標的 OBOS v2.0 數據】
+【1. 大盤與自選標的 OBOS v2.1 數據】
 {json.dumps(market_rows, ensure_ascii=False)}
 
 【2. 期權 GEX 核心點位】
@@ -442,7 +468,7 @@ def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
 
 請輸出純 JSON：
 {{
-  "summary": "300字內的繁體中文市場綜述：含外電焦點、SPX/NDX/SOX 的 EMA200 牛熊政權與 OBOS v2.0 進出場信號、以及 SPX/QQQ 的 Call/Put Wall 與 Gamma Flip 止盈止損應對策略。",
+  "summary": "300字內的繁體中文市場綜述：含外電焦點、SPX/NDX/SOX 的三級均線政權（牛市共振/年線上死叉/熊市）與 OBOS v2.1 進出場信號、以及 SPX/QQQ 的 Call/Put Wall 與 Gamma Flip 止盈止損應對策略。",
   "tickers_consensus": [
     {{
       "ticker": "代碼",
@@ -450,7 +476,7 @@ def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
       "bullCount": 1到15整數,
       "bearCount": 1到15整數,
       "sector": "板塊或自選追蹤",
-      "keyTheme": "70字內的繁體中文新聞催化劑、OBOS v2.0 六色燈號狀態與期權關鍵支撐阻力位"
+      "keyTheme": "70字內的繁體中文新聞催化劑、OBOS v2.1 六色燈號狀態與期權關鍵支撐阻力位"
     }}
   ]
 }}
@@ -469,7 +495,7 @@ def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
     spx_g = next((g for g in gex_rows if g["symbol"] == "SPX"), {})
 
     summary_text = (
-        f"【{hk_time_str} OBOS v2.0 實時研報】SPX 報 {spx_m.get('price', '--')} ({spx_m.get('change_pct', 0)}%，{spx_m.get('daily_signal', '')}，{spx_m.get('obos_level', '')})。"
+        f"【{hk_time_str} OBOS v2.1 實時研報】SPX 報 {spx_m.get('price', '--')} ({spx_m.get('change_pct', 0)}%，{spx_m.get('daily_signal', '')}，{spx_m.get('obos_level', '')})。"
         f"SPX 期權 Call Wall {spx_g.get('call_wall', '--')} / Put Wall {spx_g.get('put_wall', '--')} / Gamma Flip {spx_g.get('gamma_flip', '--')} (Net GEX {spx_g.get('net_gex', 0)}B)。"
         f"外電焦點：{top_news_zh}。"
     )
@@ -478,7 +504,7 @@ def generate_ai_daily_report(market_rows, gex_rows, focus_rows, headlines):
     consensus_list = []
     for row in focus_rows[:10]:
         tk = row["symbol"]
-        bull = max(2, min(13, 8 + (3 if row["change_pct"] >= 0 else -2) + (2 if "牛市" in row["daily_signal"] else -2)))
+        bull = max(2, min(13, 8 + (3 if row["change_pct"] >= 0 else -2) + (2 if "牛市共振" in row["daily_signal"] else -2)))
         g_info = gex_lookup.get(tk)
         g_txt = f"Call Wall ${g_info['call_wall']} / Put Wall ${g_info['put_wall']}" if g_info else row["daily_signal"]
         consensus_list.append({
@@ -503,7 +529,7 @@ def main():
             custom_items.append({"symbol": sym, "yf_ticker": yf_sym, "name": r.get("name") or sym})
 
     all_market_targets = DEFAULT_MARKET_INDEXES + custom_items
-    print(f"1. 正在更新 {len(all_market_targets)} 個大盤與自選標的 OBOS v2.0 六色信號...")
+    print(f"1. 正在更新 {len(all_market_targets)} 個大盤與自選標的 OBOS v2.1 信號...")
     market_rows = []
     for idx in all_market_targets:
         res = calc_obos_v2_and_signals(idx)
