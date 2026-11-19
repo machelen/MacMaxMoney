@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 import requests
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://julzibxroodjnoimskig.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -37,7 +36,16 @@ DEFAULT_MARKET_INDEXES = [
 
 DEFAULT_GEX_TICKERS = ["SPX", "QQQ", "IWM", "SOXL", "NVDA"]
 INDEX_YF_MAP = {item["symbol"]: item["yf_ticker"] for item in DEFAULT_MARKET_INDEXES}
-INDEX_CBOE_MAP = {"SPX": "_SPX", "NDX": "_NDX", "VIX": "_VIX", "RUT": "_RUT"}
+INDEX_CBOE_MAP = {"SPX": "_SPX", "NDX": "_NDX", "VIX": "_VIX", "RUT": "_RUT", "XSP": "_XSP", "DJX": "_DJX"}
+INDEX_ROOT_ALLOWLIST = {
+    "SPX": {"SPX", "SPXW", "SPXO"},
+    "NDX": {"NDX", "NDXP", "NDXW"},
+    "RUT": {"RUT", "RUTW", "RUTP"},
+    "VIX": {"VIX", "VIXW"},
+    "XSP": {"XSP"}
+}
+PM_SETTLED_ROOTS = {"SPXW", "NDXP", "NDXW", "RUTW", "RUTP"}
+HALF_DAY_DATES = {"2026-11-27", "2026-12-24"}
 NO_OPTION_SYMBOLS = {"DXY", "US10Y", "SOX"}
 OCC_PATTERN = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 NY_TZ = ZoneInfo("America/New_York")
@@ -92,6 +100,23 @@ def translate_to_zh_hk(text):
     except Exception:
         pass
     return text
+
+def fetch_live_spot_yf(symbol):
+    yf_sym = INDEX_YF_MAP.get(symbol, urllib.parse.quote(symbol.replace(".", "-")))
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d&includePrePost=true"
+    try:
+        r = requests.get(url, headers=YF_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        res = r.json().get("chart", {}).get("result", [])
+        if not res:
+            return None
+        meta = res[0].get("meta", {})
+        closes = [c for c in (res[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []) if c is not None and c > 0]
+        p = float(closes[-1]) if closes else float(meta.get("regularMarketPrice") or 0.0)
+        return round(p, 2) if p > 0 else None
+    except Exception:
+        return None
 
 def fetch_yf_ohlcv(ticker_encoded, interval="1d", range_str="1y"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval={interval}&range={range_str}"
@@ -234,40 +259,47 @@ def calc_obos_v2_and_signals(idx):
         print(f"[Market Error] {idx['symbol']}: {e}")
         return None
 
-def bs_gamma_scalar(S, K, T, r, sigma):
+def bsm_gamma_scalar(S, K, T, b, q, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    sqrt_t = math.sqrt(T)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_t)
+    st = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (b + 0.5 * sigma * sigma) * T) / st
     pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
-    return pdf / (S * sigma * sqrt_t)
+    return (math.exp(-q * T) * pdf) / (S * st)
+
+def interp_smile_iv(strike, k_arr, iv_arr, fallback_iv):
+    if len(k_arr) == 0:
+        return fallback_iv
+    return float(np.interp(strike, k_arr, iv_arr))
 
 def calc_gex_for_symbol(symbol):
-    """精準計算「下一個 / 當前有效 Market Session 單一到期日」之 CBOE GEX 與 BS 全鏈求根 Gamma Flip"""
+    """機構級單場次 GEX：Put-Call Parity 遠期校準 + 波動率微笑插值 + AM/PM 月結算過濾 + 統一 BSM 零誤差求根"""
     if symbol in NO_OPTION_SYMBOLS:
         return None
     cboe_ticker = INDEX_CBOE_MAP.get(symbol, re.sub(r"[^A-Z0-9]", "", symbol))
     clean_root = re.sub(r"[^A-Z]", "", symbol)
-    valid_roots = {clean_root, f"{clean_root}W", f"{clean_root}P"}
+    valid_roots = INDEX_ROOT_ALLOWLIST.get(symbol, {clean_root})
     cboe_url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_ticker}.json"
 
     try:
-        resp = requests.get(cboe_url, headers=YF_HEADERS, timeout=20)
+        resp = requests.get(cboe_url, headers=YF_HEADERS, timeout=30)
         if resp.status_code != 200:
             return None
         data = resp.json().get("data", {})
-        spot = float(data.get("current_price") or 0.0)
+        cboe_spot = float(data.get("current_price") or 0.0)
         options = data.get("options", [])
-        if spot <= 0 or not options:
+        if cboe_spot <= 0 or not options:
             return None
+
+        yf_live = fetch_live_spot_yf(symbol)
+        spot = yf_live if (yf_live and abs(yf_live - cboe_spot) / cboe_spot < 0.25) else cboe_spot
 
         now_et = datetime.datetime.now(NY_TZ)
         today_et_str = now_et.strftime("%Y-%m-%d")
         tomorrow_et_str = (now_et.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        mins_et = now_et.hour * 60 + now_et.minute
-        # 美東 16:00 收盤後，當日 0DTE 已失效，自動推進至下一個交易場次
-        min_session_date = tomorrow_et_str if mins_et >= 16 * 60 else today_et_str
-        after_open = mins_et >= (9 * 60 + 30)
+        close_hour_today = 13 if today_et_str in HALF_DAY_DATES else 16
+        rolled_after_close = (now_et.hour * 60 + now_et.minute) >= (close_hour_today * 60)
+        min_session_date = tomorrow_et_str if rolled_after_close else today_et_str
 
         parsed_all = []
         unusual_list = []
@@ -287,19 +319,20 @@ def calc_gex_for_symbol(symbol):
             strike = int(strike_raw) / 1000.0
             oi = float(opt.get("open_interest") or 0.0)
             vol = float(opt.get("volume") or 0.0)
-            raw_iv = float(opt.get("iv") or 0.0)
-            iv = raw_iv / 100.0 if raw_iv > 5.0 else raw_iv
-            cboe_gamma = float(opt.get("gamma") or 0.0)
-            last_p = float(opt.get("last_trade_price") or opt.get("bid") or opt.get("ask") or 0.0)
+            # CBOE JSON iv 一律為小數格式，不除以 100
+            iv = float(opt.get("iv") or 0.0)
+            bid = float(opt.get("bid") or 0.0)
+            ask = float(opt.get("ask") or 0.0)
+            mid_p = 0.5 * (bid + ask) if (bid > 0 and ask > 0) else float(opt.get("last_trade_price") or bid or ask or 0.0)
 
             parsed_all.append({
                 "root": root, "exp_str": exp_str, "opt_type": opt_type,
-                "strike": strike, "oi": oi, "vol": vol, "iv": iv, "cboe_gamma": cboe_gamma
+                "strike": strike, "oi": oi, "vol": vol, "iv": iv, "bid": bid, "ask": ask
             })
 
             days_diff = (datetime.date.fromisoformat(exp_str) - datetime.date.fromisoformat(min_session_date)).days
-            premium = vol * last_p * 100.0
-            if days_diff <= 14 and abs(strike - spot) / spot <= 0.15 and vol >= 300 and oi > 0 and (vol / oi) >= 1.4 and premium >= 100000:
+            premium = vol * mid_p * 100.0
+            if days_diff <= 14 and abs(strike - spot) / spot <= 0.18 and vol >= 300 and oi > 0 and (vol / oi) >= 1.4 and premium >= 100000:
                 unusual_list.append({
                     "time": now_et.strftime("%H:%M"),
                     "ticker": symbol,
@@ -315,37 +348,74 @@ def calc_gex_for_symbol(symbol):
         if not active_with_oi:
             return None
 
-        # 嚴格鎖定最近單一交易場次到期日
         target_exp = sorted({c["exp_str"] for c in active_with_oi})[0]
-        session_chain = [c for c in active_with_oi if c["exp_str"] == target_exp and abs(c["strike"] - spot) / spot <= 0.25]
+        session_chain = [c for c in active_with_oi if c["exp_str"] == target_exp and abs(c["strike"] - spot) / spot <= 0.30]
 
-        # 月結算週五 09:30 ET 開盤後，自動剔除已結算的指數 AM 合約
-        if target_exp == today_et_str and after_open:
-            if any(c["root"].endswith(("W", "P")) for c in session_chain):
-                session_chain = [c for c in session_chain if c["root"].endswith(("W", "P"))]
+        has_pm_settled = any(c["root"] in PM_SETTLED_ROOTS for c in session_chain)
+        if has_pm_settled and (target_exp == today_et_str or rolled_after_close):
+            session_chain = [c for c in session_chain if c["root"] in PM_SETTLED_ROOTS]
         if not session_chain:
             return None
 
-        near_ivs = sorted(c["iv"] for c in session_chain if 0.01 < c["iv"] < 4.0 and abs(c["strike"] - spot) / spot <= 0.04)
-        atm_iv = near_ivs[len(near_ivs) // 2] if near_ivs else 0.20
-
-        exp_dt_et = datetime.datetime.fromisoformat(f"{target_exp}T16:00:00").replace(tzinfo=NY_TZ)
-        hours_left = max(2.0, (exp_dt_et - now_et).total_seconds() / 3600.0)
+        exp_close_hour = 13 if target_exp in HALF_DAY_DATES else 16
+        exp_dt_et = datetime.datetime.fromisoformat(f"{target_exp}T{exp_close_hour:02d}:00:00").replace(tzinfo=NY_TZ)
+        hours_left = max(0.5, (exp_dt_et - now_et).total_seconds() / 3600.0)
         T = hours_left / (365.0 * 24.0)
         R_RATE = 0.043
 
+        # 1. Put-Call Parity 反推隱含遠期持有成本 b = r - q 與股息率 q
+        quote_by_k = {}
+        for c in parsed_all:
+            if c["exp_str"] != target_exp:
+                continue
+            if has_pm_settled and (c["root"] not in PM_SETTLED_ROOTS) and (target_exp == today_et_str or rolled_after_close):
+                continue
+            if abs(c["strike"] - cboe_spot) / cboe_spot <= 0.03 and c["bid"] > 0 and c["ask"] > 0:
+                quote_by_k.setdefault(c["strike"], {})[c["opt_type"]] = 0.5 * (c["bid"] + c["ask"])
+
+        fwd_ratios = []
+        for k_val, pair in quote_by_k.items():
+            if "C" in pair and "P" in pair:
+                imp_f = k_val + math.exp(R_RATE * T) * (pair["C"] - pair["P"])
+                if imp_f > 0:
+                    fwd_ratios.append(imp_f / cboe_spot)
+        if fwd_ratios:
+            med_ratio = float(np.clip(np.median(fwd_ratios), 0.97, 1.03))
+            b_carry = float(np.clip(math.log(med_ratio) / T, -0.15, 0.15))
+        else:
+            b_carry = R_RATE
+        q_yield = float(np.clip(R_RATE - b_carry, 0.0, 0.15))
+
+        # 2. 建立 Call / Put 波動率微笑曲線插值陣列
+        c_pts = sorted((c["strike"], c["iv"]) for c in session_chain if c["opt_type"] == "C" and 0.005 <= c["iv"] <= 15.0)
+        p_pts = sorted((c["strike"], c["iv"]) for c in session_chain if c["opt_type"] == "P" and 0.005 <= c["iv"] <= 15.0)
+        c_k_arr = np.array([x[0] for x in c_pts], dtype=float)
+        c_iv_arr = np.array([x[1] for x in c_pts], dtype=float)
+        p_k_arr = np.array([x[0] for x in p_pts], dtype=float)
+        p_iv_arr = np.array([x[1] for x in p_pts], dtype=float)
+
+        near_ivs = sorted(c["iv"] for c in session_chain if 0.005 <= c["iv"] <= 15.0 and abs(c["strike"] - spot) / spot <= 0.05)
+        atm_iv = near_ivs[len(near_ivs) // 2] if near_ivs else 0.20
+
+        # 3. 統一廣義 BSM 計算現價 GEX 與全鏈重定價帳本
         strike_map = {}
         book_K, book_oi, book_sigma, book_sign = [], [], [], []
+        scale_now = 100.0 * (spot ** 2) * 0.01 / 1e9
 
         for c in session_chain:
-            sigma = c["iv"] if (0.01 < c["iv"] < 4.0) else atm_iv
-            gamma_now = c["cboe_gamma"] if c["cboe_gamma"] > 0 else bs_gamma_scalar(spot, c["strike"], T, R_RATE, sigma)
-            gex_val = gamma_now * c["oi"] * 100.0 * (spot ** 2) * 0.01 / 1e9
+            is_call = c["opt_type"] == "C"
+            if 0.005 <= c["iv"] <= 15.0:
+                sigma = c["iv"]
+            else:
+                sigma = interp_smile_iv(c["strike"], c_k_arr if is_call else p_k_arr, c_iv_arr if is_call else p_iv_arr, atm_iv)
+
+            gamma_now = bsm_gamma_scalar(spot, c["strike"], T, b_carry, q_yield, sigma)
+            gex_val = gamma_now * c["oi"] * scale_now
 
             st = strike_map.setdefault(c["strike"], {
                 "callGex": 0.0, "putGex": 0.0, "callOi": 0.0, "putOi": 0.0, "callIvSum": 0.0, "putIvSum": 0.0
             })
-            if c["opt_type"] == "C":
+            if is_call:
                 st["callGex"] += gex_val
                 st["callOi"] += c["oi"]
                 st["callIvSum"] += sigma * c["oi"]
@@ -357,29 +427,31 @@ def calc_gex_for_symbol(symbol):
             book_K.append(c["strike"])
             book_oi.append(c["oi"])
             book_sigma.append(sigma)
-            book_sign.append(1.0 if c["opt_type"] == "C" else -1.0)
+            book_sign.append(1.0 if is_call else -1.0)
 
         all_strikes = sorted(strike_map.keys())
-        wall_pool = [k for k in all_strikes if abs(k - spot) / spot <= 0.15] or all_strikes
+        wall_pool = [k for k in all_strikes if abs(k - spot) / spot <= 0.25] or all_strikes
 
         call_wall = max(wall_pool, key=lambda k: strike_map[k]["callGex"])
         put_wall = min(wall_pool, key=lambda k: strike_map[k]["putGex"])
         total_net_gex = sum(v["callGex"] + v["putGex"] for v in strike_map.values())
 
-        # 向量化 Black-Scholes 全鏈重定價 + 二分法求解 Gamma Flip
+        # 4. 向量化 ±20% (201 點) 高精度掃描 + 16 次二分法求解 Gamma Flip
         arr_K = np.array(book_K, dtype=float)
         arr_oi = np.array(book_oi, dtype=float)
         arr_sig = np.array(book_sigma, dtype=float)
         arr_sgn = np.array(book_sign, dtype=float)
         sqrt_T = math.sqrt(T)
+        disc_q = math.exp(-q_yield * T)
 
         def net_gex_at_hyp_spot(hyp_s):
-            d1 = (np.log(hyp_s / arr_K) + (R_RATE + 0.5 * arr_sig ** 2) * T) / (arr_sig * sqrt_T)
+            st_arr = arr_sig * sqrt_T
+            d1 = (np.log(hyp_s / arr_K) + (b_carry + 0.5 * arr_sig ** 2) * T) / st_arr
             pdf = np.exp(-0.5 * d1 ** 2) / math.sqrt(2.0 * math.pi)
-            gammas = pdf / (hyp_s * arr_sig * sqrt_T)
+            gammas = (disc_q * pdf) / (hyp_s * st_arr)
             return float(np.sum(arr_sgn * gammas * arr_oi) * 100.0 * (hyp_s ** 2) * 0.01 / 1e9)
 
-        grid_s = np.linspace(spot * 0.88, spot * 1.12, 81)
+        grid_s = np.linspace(spot * 0.80, spot * 1.20, 201)
         grid_g = [net_gex_at_hyp_spot(float(s)) for s in grid_s]
 
         best_bracket = None
@@ -392,19 +464,17 @@ def calc_gex_for_symbol(symbol):
                     min_dist = abs(mid - spot)
                     best_bracket = (float(grid_s[i]), float(grid_s[i + 1]), g1)
 
+        gamma_flip = 0.0
         if best_bracket:
             lo, hi, g_lo = best_bracket
-            for _ in range(12):
+            for _ in range(16):
                 mid = 0.5 * (lo + hi)
                 g_mid = net_gex_at_hyp_spot(mid)
                 if (g_lo <= 0 and g_mid <= 0) or (g_lo >= 0 and g_mid >= 0):
                     lo, g_lo = mid, g_mid
                 else:
                     hi = mid
-            gamma_flip = 0.5 * (lo + hi)
-        else:
-            min_idx = int(np.argmin(np.abs(grid_g)))
-            gamma_flip = float(grid_s[min_idx])
+            gamma_flip = round(0.5 * (lo + hi), 2)
 
         near_set = set(sorted(wall_pool, key=lambda k: abs(k - spot))[:12])
         near_set.update([call_wall, put_wall])
@@ -423,20 +493,22 @@ def calc_gex_for_symbol(symbol):
                 "callIv": round(c_iv, 4),
                 "putIv": round(p_iv, 4),
                 "T": round(T, 6),
+                "b": round(b_carry, 4),
+                "q": round(q_yield, 4),
                 "exp": target_exp
             })
 
         unusual_list.sort(key=lambda x: x["_raw_prem"], reverse=True)
         top_flows = [{k: v for k, v in u.items() if k != "_raw_prem"} for u in unusual_list[:8]]
 
-        print(f" - [{symbol}] Exp={target_exp}, Spot={spot}, CW={call_wall}, PW={put_wall}, Flip={round(gamma_flip,2)}, NetGEX={round(total_net_gex,4)}B")
+        print(f" - [{symbol}] Exp={target_exp}, Spot={spot}, CW={call_wall}, PW={put_wall}, Flip={gamma_flip}, NetGEX={round(total_net_gex,4)}B")
 
         return {
             "symbol": symbol,
             "spot_price": round(spot, 2),
             "call_wall": round(call_wall, 2),
             "put_wall": round(put_wall, 2),
-            "gamma_flip": round(gamma_flip, 2),
+            "gamma_flip": gamma_flip,
             "net_gex": round(total_net_gex, 4),
             "strikes_data": strikes_data,
             "unusual_flows": top_flows,
@@ -585,7 +657,7 @@ def main():
     db_gex = fetch_table_rows("options_gex?select=symbol")
     gex_symbols = [r["symbol"].strip().upper() for r in db_gex if r.get("symbol")] if db_gex else DEFAULT_GEX_TICKERS
 
-    print(f"2. 正在計算 {len(gex_symbols)} 個期權標的「下一場次」精準 GEX: {gex_symbols}...")
+    print(f"2. 正在計算 {len(gex_symbols)} 個期權標的「下一場次」統一 BSM 精準 GEX: {gex_symbols}...")
     gex_rows = [res for sym in gex_symbols if (res := calc_gex_for_symbol(sym))]
     if gex_rows:
         r2 = requests.post(f"{SUPABASE_URL}/rest/v1/options_gex?on_conflict=symbol", headers=HEADERS, data=json.dumps(gex_rows))
