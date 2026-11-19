@@ -5,31 +5,19 @@ const INDEX_YF_MAP = {
   VIX: '%5EVIX',
   DXY: 'DX-Y.NYB',
   US10Y: '%5ETNX',
-  RUT: '%5ERUT',
-  XSP: '%5EXSP'
+  RUT: '%5ERUT'
 };
 
 const INDEX_CBOE_MAP = {
   SPX: '_SPX',
   NDX: '_NDX',
   VIX: '_VIX',
-  RUT: '_RUT',
-  XSP: '_XSP',
-  DJX: '_DJX'
+  RUT: '_RUT'
 };
 
-const INDEX_ROOT_ALLOWLIST = {
-  SPX: new Set(['SPX', 'SPXW', 'SPXO']),
-  NDX: new Set(['NDX', 'NDXP', 'NDXW']),
-  RUT: new Set(['RUT', 'RUTW', 'RUTP']),
-  VIX: new Set(['VIX', 'VIXW']),
-  XSP: new Set(['XSP'])
-};
-
-const PM_SETTLED_ROOTS = new Set(['SPXW', 'NDXP', 'NDXW', 'RUTW', 'RUTP']);
-const HALF_DAY_DATES = new Set(['2026-11-27', '2026-12-24']);
 const NO_OPTION_SYMBOLS = new Set(['DXY', 'US10Y', 'SOX']);
 const OCC_REGEX = /^([A-Z]+)(\d{6})([CP])(\d{8})$/;
+const INV_SQRT_2PI = 0.3989422804014327;
 
 const YF_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -53,6 +41,13 @@ const COMPANY_KEYWORD_MAP = {
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const fmtSigned = (n) => (n > 0 ? `+${n}` : `${n}`);
 
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 !== 0 ? s[mid] : 0.5 * (s[mid - 1] + s[mid]);
+}
+
 function getNySessionClock(nowMs = Date.now()) {
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
@@ -75,68 +70,30 @@ function getNySessionClock(nowMs = Date.now()) {
   const asUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
   const nyOffsetMs = asUtcMs - nowMs;
   const mins = hour * 60 + minute;
-  const closeHour = HALF_DAY_DATES.has(todayStr) ? 13 : 16;
-  const rolledAfterClose = mins >= closeHour * 60;
 
   return {
     todayStr,
-    minSessionDate: rolledAfterClose ? tomorrowStr : todayStr,
-    rolledAfterClose,
+    minSessionDate: mins >= 16 * 60 ? tomorrowStr : todayStr,
     nyOffsetMs,
     nowMs
   };
 }
 
-function calcYearsToExpiry(expStr, nyClock) {
+function calcCalendarYearsToClose(expStr, nyClock) {
   const [ey, em, ed] = expStr.split('-').map(Number);
-  const closeHour = HALF_DAY_DATES.has(expStr) ? 13 : 16;
-  const expCloseUtcMs = Date.UTC(ey, em - 1, ed, closeHour, 0, 0) - nyClock.nyOffsetMs;
-  const hoursLeft = Math.max(0.5, (expCloseUtcMs - nyClock.nowMs) / 3600000);
+  const expCloseUtcMs = Date.UTC(ey, em - 1, ed, 16, 0, 0) - nyClock.nyOffsetMs;
+  const hoursLeft = Math.max(0.25, (expCloseUtcMs - nyClock.nowMs) / 3600000);
   return hoursLeft / (365 * 24);
 }
 
-// 廣義 Black-Scholes-Merton Gamma (支援 Put-Call Parity 隱含持有成本 b = r - q 與股息率 q)
-function bsmGamma(S, K, T, b, q, sigma) {
+// 精確 BSM / Black-76 遠期比值 Gamma 函數
+function bsmGamma(S, K, T, fwdRatio, sigma) {
   if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
   const sqrtT = Math.sqrt(T);
-  const st = sigma * sqrtT;
-  const d1 = (Math.log(S / K) + (b + 0.5 * sigma * sigma) * T) / st;
-  const pdf = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
-  return (Math.exp(-q * T) * pdf) / (S * st);
-}
-
-function interpSmileIv(strike, pts, fallbackIv) {
-  if (!pts.length) return fallbackIv;
-  if (strike <= pts[0].k) return pts[0].iv;
-  if (strike >= pts[pts.length - 1].k) return pts[pts.length - 1].iv;
-  let lo = 0, hi = pts.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (pts[mid].k <= strike) lo = mid;
-    else hi = mid;
-  }
-  const span = pts[hi].k - pts[lo].k;
-  if (span <= 0) return pts[lo].iv;
-  const w = (strike - pts[lo].k) / span;
-  return pts[lo].iv * (1 - w) + pts[hi].iv * w;
-}
-
-function extractLatestPrice(yfChartResult) {
-  if (!yfChartResult) return null;
-  const meta = yfChartResult.meta || {};
-  const closes = yfChartResult.indicators?.quote?.[0]?.close || [];
-  let lastBarPrice = null;
-  for (let i = closes.length - 1; i >= 0; i--) {
-    if (closes[i] != null && Number(closes[i]) > 0) {
-      lastBarPrice = Number(closes[i]);
-      break;
-    }
-  }
-  const price = lastBarPrice || Number(meta.regularMarketPrice || 0);
-  if (!price || price <= 0) return null;
-  const prev = Number(meta.chartPreviousClose || meta.previousClose || price);
-  const change = prev ? Number((((price - prev) / prev) * 100).toFixed(2)) : 0;
-  return { price: Number(price.toFixed(2)), change };
+  const sigSqrtT = sigma * sqrtT;
+  const d1 = (Math.log((S * fwdRatio) / K) + 0.5 * sigma * sigma * T) / sigSqrtT;
+  const pdf = INV_SQRT_2PI * Math.exp(-0.5 * d1 * d1);
+  return pdf / (S * sigSqrtT);
 }
 
 function decodeXmlText(str = '') {
@@ -301,12 +258,11 @@ async function fetchActionableIntel(watchSymbols) {
   return { session_type: sessionType, items: enriched };
 }
 
-async function fetchYfData(yfSym, interval, range, prepost = false) {
-  const extra = prepost ? '&includePrePost=true' : '';
-  const url1 = `https://query1.finance.yahoo.com/v8/finance/chart/${yfSym}?interval=${interval}&range=${range}${extra}`;
+async function fetchYfData(yfSym, interval, range) {
+  const url1 = `https://query1.finance.yahoo.com/v8/finance/chart/${yfSym}?interval=${interval}&range=${range}`;
   let r = await fetch(url1, { headers: YF_HEADERS });
   if (!r.ok) {
-    const url2 = `https://query2.finance.yahoo.com/v8/finance/chart/${yfSym}?interval=${interval}&range=${range}${extra}`;
+    const url2 = `https://query2.finance.yahoo.com/v8/finance/chart/${yfSym}?interval=${interval}&range=${range}`;
     r = await fetch(url2, { headers: YF_HEADERS });
   }
   if (!r.ok) return null;
@@ -479,16 +435,16 @@ function computeObosV2(symbol, resDaily, resHourly) {
   };
 }
 
-// 機構級單場次 GEX 運算：Put-Call Parity 遠期校準 + 波動率微笑插值 + AM/PM 月結算過濾 + 統一 BSM 零誤差求根
+// 機構級「下一交易場次單一到期日」GEX 運算引擎 (統一 Put-Call Parity 偏度 IV + 實時現價重定價)
 async function computeCboeGex(symbol, liveSpotHint = null) {
   if (NO_OPTION_SYMBOLS.has(symbol)) return null;
   const cboeSym = INDEX_CBOE_MAP[symbol] || symbol.replace(/[^A-Z0-9]/g, '');
   const cleanBaseRoot = symbol.replace(/[^A-Z]/g, '');
-  const validRoots = INDEX_ROOT_ALLOWLIST[symbol] || new Set([cleanBaseRoot]);
+  const validRoots = new Set([cleanBaseRoot, `${cleanBaseRoot}W`, `${cleanBaseRoot}P`]);
 
   const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSym}.json`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 11000);
+  const timer = setTimeout(() => controller.abort(), 6800);
 
   try {
     const r = await fetch(url, { headers: YF_HEADERS, signal: controller.signal });
@@ -500,7 +456,8 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
     const options = data.options || [];
     if (cboeSpot <= 0 || !options.length) return null;
 
-    const spot = (liveSpotHint && liveSpotHint > 0 && Math.abs(liveSpotHint - cboeSpot) / cboeSpot < 0.25)
+    // 若傳入實時 Yahoo 報價且與 CBOE 現價差距在合理 ±15% 內，採用實時現價進行全鏈重定價
+    const activeSpot = (liveSpotHint && liveSpotHint > 0 && Math.abs(liveSpotHint - cboeSpot) / cboeSpot <= 0.15)
       ? Number(liveSpotHint)
       : cboeSpot;
 
@@ -520,17 +477,18 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
       const strike = parseInt(strikeRaw, 10) / 1000;
       const oi = Number(opt.open_interest || 0);
       const vol = Number(opt.volume || 0);
-      // CBOE JSON iv 一律為小數格式 (如 0.15 = 15%, 6.2 = 620%)，嚴禁除以 100
-      const iv = Number(opt.iv || 0);
+      const rawIv = Number(opt.iv || 0);
+      const iv = rawIv > 5 ? rawIv / 100 : rawIv;
+      const cboeGamma = Number(opt.gamma || 0);
       const bid = Number(opt.bid || 0);
       const ask = Number(opt.ask || 0);
-      const midP = (bid > 0 && ask > 0) ? 0.5 * (bid + ask) : Number(opt.last_trade_price || bid || ask || 0);
+      const lastP = Number(opt.last_trade_price || (bid > 0 && ask > 0 ? 0.5 * (bid + ask) : bid || ask || 0));
 
-      parsedAll.push({ root, expStr, optType, strike, oi, vol, iv, bid, ask, midP });
+      parsedAll.push({ root, expStr, optType, strike, oi, vol, iv, cboeGamma, bid, ask });
 
-      const premium = vol * midP * 100;
+      const premium = vol * lastP * 100;
       const daysDiff = (Date.parse(expStr) - Date.parse(nyClock.minSessionDate)) / 86400000;
-      if (daysDiff <= 14 && Math.abs(strike - spot) / spot <= 0.18 && vol >= 300 && oi > 0 && vol / oi >= 1.4 && premium >= 100000) {
+      if (daysDiff <= 14 && Math.abs(strike - activeSpot) / activeSpot <= 0.20 && vol >= 300 && oi > 0 && vol / oi >= 1.4 && premium >= 100000) {
         unusualList.push({
           time: new Date().toISOString().slice(11, 16),
           ticker: symbol,
@@ -544,115 +502,175 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
       }
     }
 
+    const validChain = parsedAll.filter(c => c.oi > 0 || (c.iv >= 0.02 && c.iv <= 4.0));
     const activeWithOi = parsedAll.filter(c => c.oi > 0);
     if (!activeWithOi.length) return null;
 
+    // 1. 嚴格鎖定最近單一交易場次到期日 (Next / Active Market Session)
     const uniqueExps = [...new Set(activeWithOi.map(c => c.expStr))].sort();
     const targetExp = uniqueExps[0];
-    let sessionChain = activeWithOi.filter(c => c.expStr === targetExp && Math.abs(c.strike - spot) / spot <= 0.30);
 
-    // 月結算日 (如第三個週五) 若目標為下一緊接場次且存在 PM 週選權 (SPXW/NDXP/RUTW)，剔除已停止交易的 AM 合約
-    const hasPmSettled = sessionChain.some(c => PM_SETTLED_ROOTS.has(c.root));
-    if (hasPmSettled && (targetExp === nyClock.todayStr || nyClock.rolledAfterClose)) {
-      sessionChain = sessionChain.filter(c => PM_SETTLED_ROOTS.has(c.root));
-    }
-    if (!sessionChain.length) return null;
+    let expChain = validChain.filter(c => c.expStr === targetExp && Math.abs(c.strike - activeSpot) / activeSpot <= 0.40);
 
-    const T = calcYearsToExpiry(targetExp, nyClock);
-    const R_RATE = 0.043;
-
-    // 1. 透過同場次 ATM Put-Call Parity 反推隱含遠期持有成本 b = r - q 與股息率 q
-    const quoteByStrike = {};
-    for (const c of parsedAll) {
-      if (c.expStr !== targetExp || (hasPmSettled && !PM_SETTLED_ROOTS.has(c.root) && (targetExp === nyClock.todayStr || nyClock.rolledAfterClose))) continue;
-      if (Math.abs(c.strike - cboeSpot) / cboeSpot > 0.03) continue;
-      if (c.bid > 0 && c.ask > 0) {
-        if (!quoteByStrike[c.strike]) quoteByStrike[c.strike] = {};
-        quoteByStrike[c.strike][c.optType] = 0.5 * (c.bid + c.ask);
+    // 月結算日 (如第三個週五) 當鎖定場次即為下一交易場次時，標準 AM 合約已於前一日 16:00 ET 停牌，僅保留全天交易之 PM 合約 (SPXW/NDXP/RUTW)
+    if (targetExp === nyClock.minSessionDate) {
+      const hasPmRoot = expChain.some(c => (c.root.endsWith('W') || c.root.endsWith('P')) && c.oi > 0);
+      if (hasPmRoot) {
+        expChain = expChain.filter(c => c.root.endsWith('W') || c.root.endsWith('P'));
       }
     }
-    const fwdRatios = [];
-    Object.entries(quoteByStrike).forEach(([kStr, pair]) => {
-      if (pair.C != null && pair.P != null) {
-        const kNum = Number(kStr);
-        const impliedF = kNum + Math.exp(R_RATE * T) * (pair.C - pair.P);
-        if (impliedF > 0) fwdRatios.push(impliedF / cboeSpot);
+    if (!expChain.some(c => c.oi > 0)) return null;
+
+    // 2. 按行權價聚合，建立 Put-Call Parity 偏度波動率曲線 (解決深價內 IV=0 / Gamma=0 漏算問題)
+    const rawByStrike = {};
+    for (const c of expChain) {
+      if (!rawByStrike[c.strike]) {
+        rawByStrike[c.strike] = {
+          callOi: 0, putOi: 0,
+          callIv: 0, putIv: 0,
+          callGamma: 0, putGamma: 0,
+          callMid: 0, putMid: 0
+        };
       }
-    });
-    fwdRatios.sort((a, b) => a - b);
-    const medFwdRatio = fwdRatios.length ? clamp(fwdRatios[Math.floor(fwdRatios.length / 2)], 0.97, 1.03) : 1.0;
-    const bCarry = fwdRatios.length ? clamp(Math.log(medFwdRatio) / T, -0.15, 0.15) : R_RATE;
-    const qYield = clamp(R_RATE - bCarry, 0, 0.15);
-
-    // 2. 建立 Call / Put 波動率微笑曲線，補齊深價內缺漏 IV
-    const validCallPts = sessionChain
-      .filter(c => c.optType === 'C' && c.iv >= 0.005 && c.iv <= 15.0)
-      .map(c => ({ k: c.strike, iv: c.iv }))
-      .sort((a, b) => a.k - b.k);
-    const validPutPts = sessionChain
-      .filter(c => c.optType === 'P' && c.iv >= 0.005 && c.iv <= 15.0)
-      .map(c => ({ k: c.strike, iv: c.iv }))
-      .sort((a, b) => a.k - b.k);
-
-    const nearAtmIvs = sessionChain
-      .filter(c => c.iv >= 0.005 && c.iv <= 15.0 && Math.abs(c.strike - spot) / spot <= 0.05)
-      .map(c => c.iv)
-      .sort((a, b) => a - b);
-    const atmIv = nearAtmIvs.length ? nearAtmIvs[Math.floor(nearAtmIvs.length / 2)] : 0.20;
-
-    // 3. 統一使用廣義 BSM 計算現價各行權價 GEX 與全鏈重定價帳本 (保證 100% 數學自洽無斷層)
-    const strikeMap = {};
-    const repricingBook = [];
-    const scaleNow = (100 * spot * spot * 0.01) / 1e9;
-
-    for (const c of sessionChain) {
-      const isCall = c.optType === 'C';
-      const sigma = (c.iv >= 0.005 && c.iv <= 15.0)
-        ? c.iv
-        : interpSmileIv(c.strike, isCall ? validCallPts : validPutPts, atmIv);
-
-      const gammaNow = bsmGamma(spot, c.strike, T, bCarry, qYield, sigma);
-      const gexVal = gammaNow * c.oi * scaleNow;
-
-      if (!strikeMap[c.strike]) {
-        strikeMap[c.strike] = { callGex: 0, putGex: 0, callOi: 0, putOi: 0, callIvSum: 0, putIvSum: 0 };
-      }
-      if (isCall) {
-        strikeMap[c.strike].callGex += gexVal;
-        strikeMap[c.strike].callOi += c.oi;
-        strikeMap[c.strike].callIvSum += sigma * c.oi;
+      const node = rawByStrike[c.strike];
+      if (c.optType === 'C') {
+        node.callOi += c.oi;
+        if (c.iv >= 0.02 && c.iv <= 4.0) node.callIv = c.iv;
+        if (c.cboeGamma > node.callGamma) node.callGamma = c.cboeGamma;
+        if (c.bid > 0 && c.ask > 0) node.callMid = 0.5 * (c.bid + c.ask);
       } else {
-        strikeMap[c.strike].putGex -= gexVal;
-        strikeMap[c.strike].putOi += c.oi;
-        strikeMap[c.strike].putIvSum += sigma * c.oi;
+        node.putOi += c.oi;
+        if (c.iv >= 0.02 && c.iv <= 4.0) node.putIv = c.iv;
+        if (c.cboeGamma > node.putGamma) node.putGamma = c.cboeGamma;
+        if (c.bid > 0 && c.ask > 0) node.putMid = 0.5 * (c.bid + c.ask);
       }
-
-      repricingBook.push({ strike: c.strike, oi: c.oi, sigma, isCall });
     }
 
-    const allStrikes = Object.keys(strikeMap).map(Number).sort((a, b) => a - b);
-    const wallPool = allStrikes.filter(k => Math.abs(k - spot) / spot <= 0.25);
-    const pool = wallPool.length ? wallPool : allStrikes;
+    const sortedStrikes = Object.keys(rawByStrike).map(Number).sort((a, b) => a - b);
+
+    // 計算平價 ATM IV 基準
+    const atmIvCandidates = [];
+    for (const k of sortedStrikes) {
+      if (Math.abs(k - cboeSpot) / cboeSpot <= 0.04) {
+        const n = rawByStrike[k];
+        const cleanIv = k < cboeSpot ? (n.putIv || n.callIv) : (n.callIv || n.putIv);
+        if (cleanIv >= 0.02 && cleanIv <= 4.0) atmIvCandidates.push(cleanIv);
+      }
+    }
+    const atmIv = atmIvCandidates.length ? median(atmIvCandidates) : 0.20;
+
+    // 為每個行權價配對最乾淨的 OTM IV，缺失時線性插值
+    const knownIvPts = [];
+    for (const k of sortedStrikes) {
+      const n = rawByStrike[k];
+      const preferred = k < cboeSpot ? (n.putIv || n.callIv) : (n.callIv || n.putIv);
+      if (preferred >= 0.02 && preferred <= 4.0) {
+        n.sigma = preferred;
+        knownIvPts.push([k, preferred]);
+      } else {
+        n.sigma = 0;
+      }
+    }
+
+    for (const k of sortedStrikes) {
+      const n = rawByStrike[k];
+      if (n.sigma > 0) continue;
+      if (!knownIvPts.length) {
+        n.sigma = atmIv;
+        continue;
+      }
+      let left = null, right = null;
+      for (const pt of knownIvPts) {
+        if (pt[0] < k) left = pt;
+        else if (pt[0] > k && !right) right = pt;
+      }
+      if (left && right) {
+        const w = (k - left[0]) / (right[0] - left[0]);
+        n.sigma = left[1] + w * (right[1] - left[1]);
+      } else if (left) {
+        n.sigma = left[1];
+      } else {
+        n.sigma = right[1];
+      }
+    }
+
+    // 3. 由 ATM Put-Call Parity 反推隱含遠期比值 F/S，並由 CBOE 平價 Gamma 反推精確有效時間 T_eff
+    const T_cal = calcCalendarYearsToClose(targetExp, nyClock);
+    const R_RATE = 0.043;
+    let fwdRatio = Math.exp((R_RATE - 0.012) * T_cal);
+
+    const atmParityStrikes = sortedStrikes
+      .filter(k => Math.abs(k - cboeSpot) / cboeSpot <= 0.02 && rawByStrike[k].callMid > 0 && rawByStrike[k].putMid > 0)
+      .sort((a, b) => Math.abs(a - cboeSpot) - Math.abs(b - cboeSpot));
+
+    if (atmParityStrikes.length > 0) {
+      const k0 = atmParityStrikes[0];
+      const impliedF = k0 + Math.exp(R_RATE * T_cal) * (rawByStrike[k0].callMid - rawByStrike[k0].putMid);
+      if (impliedF > 0 && Math.abs(impliedF - cboeSpot) / cboeSpot <= 0.03) {
+        fwdRatio = impliedF / cboeSpot;
+      }
+    }
+
+    const impliedTSamples = [];
+    for (const k of sortedStrikes) {
+      if (Math.abs(k - cboeSpot) / cboeSpot > 0.018) continue;
+      const n = rawByStrike[k];
+      const refGamma = k < cboeSpot ? n.putGamma : n.callGamma;
+      const refIv = k < cboeSpot ? n.putIv : n.callIv;
+      if (refGamma >= 0.0015 && refIv >= 0.02 && refIv <= 3.0) {
+        let sqrtT = INV_SQRT_2PI / (cboeSpot * refIv * refGamma);
+        for (let iter = 0; iter < 2; iter++) {
+          const tEst = sqrtT * sqrtT;
+          const d1 = (Math.log((cboeSpot * fwdRatio) / k) + 0.5 * refIv * refIv * tEst) / (refIv * sqrtT);
+          const pdf = INV_SQRT_2PI * Math.exp(-0.5 * d1 * d1);
+          sqrtT = pdf / (cboeSpot * refIv * refGamma);
+        }
+        const tFinal = sqrtT * sqrtT;
+        if (Number.isFinite(tFinal) && tFinal > 0) impliedTSamples.push(tFinal);
+      }
+    }
+
+    const T_eff = impliedTSamples.length >= 2
+      ? clamp(median(impliedTSamples), T_cal * 0.15, T_cal * 4.5)
+      : T_cal;
+
+    // 4. 使用統一 BSM 引擎在實時現價 (activeSpot) 計算全鏈 GEX 與各行權價分佈
+    const activeStrikes = sortedStrikes.filter(k => rawByStrike[k].callOi > 0 || rawByStrike[k].putOi > 0);
+    const strikeMap = {};
+    const scaleNow = (100 * activeSpot * activeSpot * 0.01) / 1e9;
+
+    for (const k of activeStrikes) {
+      const n = rawByStrike[k];
+      const g = bsmGamma(activeSpot, k, T_eff, fwdRatio, n.sigma);
+      const callGex = g * n.callOi * scaleNow;
+      const putGex = -(g * n.putOi * scaleNow);
+      strikeMap[k] = { callGex, putGex, callOi: n.callOi, putOi: n.putOi, sigma: n.sigma };
+    }
+
+    // 放寬期權牆搜尋池至 ±30%，確保 SOXL/TSLA 等高波動標的不會被切掉外圍大牆
+    const wallPool = activeStrikes.filter(k => Math.abs(k - activeSpot) / activeSpot <= 0.30);
+    const pool = wallPool.length ? wallPool : activeStrikes;
 
     const callWall = pool.reduce((a, b) => (strikeMap[b].callGex > strikeMap[a].callGex ? b : a));
     const putWall = pool.reduce((a, b) => (strikeMap[b].putGex < strikeMap[a].putGex ? b : a));
-    const totalNetGex = allStrikes.reduce((acc, k) => acc + strikeMap[k].callGex + strikeMap[k].putGex, 0);
+    const totalNetGex = activeStrikes.reduce((acc, k) => acc + strikeMap[k].callGex + strikeMap[k].putGex, 0);
 
-    // 4. 在 ±20% 區間以 200 步高精度掃描 + 16 次二分法求根 Gamma Flip
+    // 5. 同一套 BSM 引擎在 ±20% 區間掃描 + 14 次二分法求根 Gamma Flip (無變號時回傳 0，絕不偽造邊界值)
     const netGexAtHypSpot = (hypS) => {
       let total = 0;
-      const scale = (100 * hypS * hypS * 0.01) / 1e9;
-      for (const item of repricingBook) {
-        const g = bsmGamma(hypS, item.strike, T, bCarry, qYield, item.sigma);
-        const val = g * item.oi * scale;
-        total += item.isCall ? val : -val;
+      const sc = (100 * hypS * hypS * 0.01) / 1e9;
+      for (const k of activeStrikes) {
+        const st = strikeMap[k];
+        const netOi = st.callOi - st.putOi;
+        if (netOi === 0) continue;
+        total += bsmGamma(hypS, k, T_eff, fwdRatio, st.sigma) * netOi * sc;
       }
       return total;
     };
 
-    const STEPS = 200;
-    const minS = spot * 0.80;
-    const maxS = spot * 1.20;
+    const STEPS = 160;
+    const minS = activeSpot * 0.80;
+    const maxS = activeSpot * 1.20;
     const stepS = (maxS - minS) / STEPS;
     const gridS = [];
     const gridGex = [];
@@ -666,9 +684,10 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
     let minBracketDist = Infinity;
     for (let i = 0; i < STEPS; i++) {
       const g1 = gridGex[i], g2 = gridGex[i + 1];
-      if ((g1 <= 0 && g2 >= 0) || (g1 >= 0 && g2 <= 0)) {
+      const hasSignChange = (g1 < 0 && g2 >= 0) || (g1 > 0 && g2 <= 0);
+      if (hasSignChange && (Math.abs(g1) + Math.abs(g2) > 1e-9)) {
         const mid = 0.5 * (gridS[i] + gridS[i + 1]);
-        const dist = Math.abs(mid - spot);
+        const dist = Math.abs(mid - activeSpot);
         if (dist < minBracketDist) {
           minBracketDist = dist;
           bestBracket = [gridS[i], gridS[i + 1], g1];
@@ -676,11 +695,10 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
       }
     }
 
-    // 若全鏈 ±20% 同號無過零點，回傳 0 代表單邊帳本，絕不輸出虛假邊界點位
     let gammaFlip = 0;
     if (bestBracket) {
       let [lo, hi, gLo] = bestBracket;
-      for (let iter = 0; iter < 16; iter++) {
+      for (let iter = 0; iter < 14; iter++) {
         const mid = 0.5 * (lo + hi);
         const gMid = netGexAtHypSpot(mid);
         if ((gLo <= 0 && gMid <= 0) || (gLo >= 0 && gMid >= 0)) {
@@ -693,7 +711,7 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
     }
 
     const nearSet = new Set(
-      [...pool].sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot)).slice(0, 12)
+      [...pool].sort((a, b) => Math.abs(a - activeSpot) - Math.abs(b - activeSpot)).slice(0, 12)
     );
     nearSet.add(callWall);
     nearSet.add(putWall);
@@ -701,18 +719,14 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
 
     const strikesData = displayStrikes.map(k => {
       const st = strikeMap[k];
-      const cIv = st.callOi > 0 ? st.callIvSum / st.callOi : atmIv;
-      const pIv = st.putOi > 0 ? st.putIvSum / st.putOi : atmIv;
       return {
         strike: Number(k.toFixed(2)),
         callGex: Number(st.callGex.toFixed(5)),
         putGex: Number(st.putGex.toFixed(5)),
         netGex: Number((st.callGex + st.putGex).toFixed(5)),
-        callIv: Number(cIv.toFixed(4)),
-        putIv: Number(pIv.toFixed(4)),
-        T: Number(T.toFixed(6)),
-        b: Number(bCarry.toFixed(4)),
-        q: Number(qYield.toFixed(4)),
+        sigma: Number(st.sigma.toFixed(4)),
+        T: Number(T_eff.toFixed(6)),
+        fwdRatio: Number(fwdRatio.toFixed(6)),
         exp: targetExp
       };
     });
@@ -722,7 +736,7 @@ async function computeCboeGex(symbol, liveSpotHint = null) {
 
     return {
       symbol,
-      spot_price: Number(spot.toFixed(2)),
+      spot_price: Number(activeSpot.toFixed(2)),
       call_wall: Number(callWall.toFixed(2)),
       put_wall: Number(putWall.toFixed(2)),
       gamma_flip: gammaFlip,
@@ -758,31 +772,27 @@ export default async function handler(req, res) {
     const gexOnly = req.query?.gexOnly === '1';
 
     try {
-      const liveChart = await fetchYfData(yfSym, '1m', '1d', true);
-      const liveQuote = extractLatestPrice(liveChart);
-
       if (gexOnly) {
-        const gexRow = await computeCboeGex(rawSym, liveQuote?.price);
+        const yfSnap = await fetchYfData(yfSym, '1m', '1d');
+        const liveSpot = yfSnap?.meta?.regularMarketPrice ? Number(yfSnap.meta.regularMarketPrice) : null;
+        const gexRow = await computeCboeGex(rawSym, liveSpot);
         if (!gexRow) {
           return res.status(404).json({ error: `找不到 ${rawSym} 的下場次 CBOE 期權數據 / No CBOE options chain for ${rawSym}` });
         }
         return res.status(200).json({ gexRow });
       }
 
-      const [resDaily, resHourly, gexRow] = await Promise.all([
+      const [resDaily, resHourly] = await Promise.all([
         fetchYfData(yfSym, '1d', '1y'),
-        fetchYfData(yfSym, '60m', '1mo'),
-        computeCboeGex(rawSym, liveQuote?.price)
+        fetchYfData(yfSym, '60m', '1mo')
       ]);
 
       const marketRow = computeObosV2(rawSym, resDaily, resHourly);
       if (!marketRow) {
         return res.status(404).json({ error: `找不到代碼 ${rawSym} / Symbol ${rawSym} not found` });
       }
-      if (liveQuote) {
-        marketRow.price = liveQuote.price;
-        marketRow.change_pct = liveQuote.change;
-      }
+
+      const gexRow = await computeCboeGex(rawSym, marketRow.price);
       return res.status(200).json({ marketRow, gexRow });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -800,9 +810,13 @@ export default async function handler(req, res) {
       uniqueSymbols.map(async (symbol) => {
         try {
           const yfSym = INDEX_YF_MAP[symbol] || encodeURIComponent(symbol.replace('.', '-'));
-          const data = await fetchYfData(yfSym, '1m', '1d', true);
-          const q = extractLatestPrice(data);
-          return [symbol, q];
+          const data = await fetchYfData(yfSym, '1m', '1d');
+          const meta = data?.meta;
+          if (!meta || meta.regularMarketPrice == null) return [symbol, null];
+          const price = Number(meta.regularMarketPrice);
+          const prev = Number(meta.chartPreviousClose || meta.previousClose || price);
+          const change = prev ? Number((((price - prev) / prev) * 100).toFixed(2)) : 0;
+          return [symbol, { price: Number(price.toFixed(2)), change }];
         } catch {
           return [symbol, null];
         }
