@@ -38,7 +38,8 @@ const FALLBACK_MARKET = [
 
 const FALLBACK_GEX = {
   SPX: {
-    spot: 7323.63, baseSpot: 7323.63, callWall: 7350, putWall: 7300, gammaFlip: 7342.5, netGex: -3.42, baseNetGex: -3.42, exp: '',
+    spot: 7323.63, baseSpot: 7323.63, callWall: 7350, baseCallWall: 7350, putWall: 7300, basePutWall: 7300,
+    gammaFlip: 7342.5, netGex: -3.42, baseNetGex: -3.42, baseSliceSum: 0, exp: '', curve: [],
     strikes: [
       { strike: 7300, callGex: 0.12, putGex: -1.45, baseCallGex: 0.12, basePutGex: -1.45 },
       { strike: 7325, callGex: 0.38, putGex: -0.62, baseCallGex: 0.38, basePutGex: -0.62 },
@@ -47,16 +48,131 @@ const FALLBACK_GEX = {
   }
 };
 
-// 前端精確 Black-Scholes Gamma 函數 (供每 5 秒實時無漂移重算)
-function bsGammaJs(S, K, T, r, sigma) {
+// 對齊後端 live.js / .py 之含隱含遠期率 (Put-Call Parity fwdRatio) BSM Gamma 函數
+function bsmGammaJs(S, K, T, r, sigma, fwdRatio = 1.0) {
   if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
   const sqrtT = Math.sqrt(T);
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+  const lnFwd = Math.log(Math.max(fwdRatio, 0.5));
+  const discountQ = Math.exp(-r * T) * fwdRatio;
+  const d1 = (Math.log(S / K) + lnFwd + 0.5 * sigma * sigma * T) / (sigma * sqrtT);
   const pdf = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
-  return pdf / (S * sigma * sqrtT);
+  return (discountQ * pdf) / (S * sigma * sqrtT);
 }
 
-// 智慧格式化單場次 GEX 數值 (自動適配大盤 $B 與個股/ETF $M，避免小數四捨五入歸零)
+// 對後端預計算之 25 點全鏈精確曲線 (含精確過零點) 線性插值，確保跨越 Gamma Flip 正負號 100% 同步
+function interpolateFullChainCurve(curve, liveSpot) {
+  if (!Array.isArray(curve) || curve.length < 2) return null;
+  if (liveSpot < curve[0][0] || liveSpot > curve[curve.length - 1][0]) return null;
+  for (let i = 0; i < curve.length - 1; i++) {
+    const [x0, y0] = curve[i];
+    const [x1, y1] = curve[i + 1];
+    if (liveSpot >= x0 && liveSpot <= x1) {
+      if (x1 === x0) return y0;
+      return y0 + ((liveSpot - x0) / (x1 - x0)) * (y1 - y0);
+    }
+  }
+  return null;
+}
+
+// 將資料庫單筆 options_gex 紀錄封裝為基準結構
+function parseDbGexRow(r) {
+  const baseSpot = Number(r.spot_price);
+  const baseNetGex = Number(r.net_gex);
+  const baseCallWall = Number(r.call_wall);
+  const basePutWall = Number(r.put_wall);
+  const rawStrikes = Array.isArray(r.strikes_data) && r.strikes_data.length > 0
+    ? r.strikes_data
+    : [
+        { strike: basePutWall, callGex: 0.05, putGex: -0.5 },
+        { strike: baseCallWall, callGex: 0.6, putGex: -0.05 },
+      ];
+  const strikes = rawStrikes.map(st => ({
+    ...st,
+    callGex: Number(st.callGex || 0),
+    putGex: Number(st.putGex || 0),
+    baseCallGex: Number(st.callGex || 0),
+    basePutGex: Number(st.putGex || 0)
+  }));
+  const baseSliceSum = strikes.reduce((acc, s) => acc + s.baseCallGex + s.basePutGex, 0);
+
+  return {
+    spot: baseSpot,
+    baseSpot,
+    callWall: baseCallWall,
+    baseCallWall,
+    putWall: basePutWall,
+    basePutWall,
+    gammaFlip: Number(r.gamma_flip),
+    netGex: baseNetGex,
+    baseNetGex,
+    baseSliceSum,
+    exp: rawStrikes[0]?.exp || '',
+    curve: Array.isArray(rawStrikes[0]?.curve) ? rawStrikes[0].curve : [],
+    strikes
+  };
+}
+
+// 以最新即時現價無漂移重算單一標的之行權價柱狀圖、全鏈 Net GEX 與動態期權牆
+function recalcGexEntryWithLiveSpot(entry, liveSpot) {
+  const s0 = entry?.baseSpot;
+  if (!liveSpot || !s0 || s0 <= 0) return entry;
+
+  const s2Ratio = Math.pow(liveSpot / s0, 2);
+  const hasExactParams = entry.strikes?.some(st => st.T && st.callIv);
+
+  const updatedStrikes = (entry.strikes || []).map(st => {
+    const T = Number(st.T || 0.0025);
+    const cIv = Number(st.callIv || 0.20);
+    const pIv = Number(st.putIv || 0.20);
+    const fwd = Number(st.fwdRatio || 1.0);
+
+    const gCall0 = bsmGammaJs(s0, st.strike, T, 0.043, cIv, fwd);
+    const gCall1 = bsmGammaJs(liveSpot, st.strike, T, 0.043, cIv, fwd);
+    // 放寬上限至 50 倍，完整保留 0DTE 價外轉平價 (ATM) 時的真實 Gamma 尖峰
+    const callRatio = gCall0 > 1e-12 ? Math.min(Math.max((gCall1 / gCall0) * s2Ratio, 0), 50.0) : s2Ratio;
+
+    const gPut0 = bsmGammaJs(s0, st.strike, T, 0.043, pIv, fwd);
+    const gPut1 = bsmGammaJs(liveSpot, st.strike, T, 0.043, pIv, fwd);
+    const putRatio = gPut0 > 1e-12 ? Math.min(Math.max((gPut1 / gPut0) * s2Ratio, 0), 50.0) : s2Ratio;
+
+    return {
+      ...st,
+      callGex: Number(((st.baseCallGex ?? st.callGex) * callRatio).toFixed(6)),
+      putGex: Number(((st.basePutGex ?? st.putGex) * putRatio).toFixed(6))
+    };
+  });
+
+  // 優先使用後端 25 點全鏈精確曲線插值 Net GEX；僅當單日漲跌超出 ±10% 時回退局部差額
+  const exactFromCurve = interpolateFullChainCurve(entry.curve, liveSpot);
+  let updatedNetGex;
+  if (exactFromCurve !== null) {
+    updatedNetGex = Number(exactFromCurve.toFixed(5));
+  } else {
+    const newSliceSum = updatedStrikes.reduce((acc, s) => acc + s.callGex + s.putGex, 0);
+    const deltaSlice = newSliceSum - (entry.baseSliceSum ?? newSliceSum);
+    updatedNetGex = Number(((entry.baseNetGex ?? entry.netGex) + deltaSlice).toFixed(5));
+  }
+
+  // 由於 updatedStrikes 必包含原 Call/Put Wall 與現價附近 12 檔，若盤中移倉或現價推移使鄰近檔位超越原牆則即時反映
+  let nextCallWall = entry.baseCallWall ?? entry.callWall;
+  let nextPutWall = entry.basePutWall ?? entry.putWall;
+  if (hasExactParams && updatedStrikes.length >= 3) {
+    const maxCallRow = updatedStrikes.reduce((a, b) => (b.callGex > a.callGex ? b : a));
+    const minPutRow = updatedStrikes.reduce((a, b) => (b.putGex < a.putGex ? b : a));
+    if (maxCallRow.callGex > 0) nextCallWall = maxCallRow.strike;
+    if (minPutRow.putGex < 0) nextPutWall = minPutRow.strike;
+  }
+
+  return {
+    ...entry,
+    spot: liveSpot,
+    callWall: nextCallWall,
+    putWall: nextPutWall,
+    netGex: updatedNetGex,
+    strikes: updatedStrikes
+  };
+}
+
 function formatGexUnit(valB, signed = true) {
   const num = Number(valB || 0);
   const prefix = signed && num > 0 ? '+' : '';
@@ -155,6 +271,7 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState('--:--:--');
   const [isLiveTick, setIsLiveTick] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isRecalcingChain, setIsRecalcingChain] = useState(false);
   const [dbConnected, setDbConnected] = useState(false);
 
   const [watchInput, setWatchInput] = useState('');
@@ -181,7 +298,13 @@ export default function App() {
   const [isSavingPos, setIsSavingPos] = useState(false);
 
   const watchedSymbolsRef = useRef(['SPX', 'NDX', 'SOX', 'VIX', 'DXY', 'US10Y', 'QQQ', 'IWM', 'SOXL', 'NVDA']);
+  const liveQuotesRef = useRef({});
+  const selectedGexRef = useRef('SPX');
   const autoUpgradedIntelRef = useRef(false);
+
+  useEffect(() => {
+    selectedGexRef.current = selectedGexTicker;
+  }, [selectedGexTicker]);
 
   useEffect(() => {
     const allSyms = new Set([
@@ -223,6 +346,43 @@ export default function App() {
     }
   }, [apiKey]);
 
+  // 直連 /api/live 對當前選中標的進行完整 CBOE 期權鏈重算 (刷新 T、IV Skew、Walls、Gamma Flip 與 25 點曲線)
+  const refreshActiveGexChain = useCallback(async (targetSym) => {
+    const sym = (targetSym || selectedGexRef.current || '').trim().toUpperCase();
+    if (!sym || ['DXY', 'US10Y', 'SOX'].includes(sym)) return;
+    setIsRecalcingChain(true);
+    try {
+      const resp = await fetch(`/api/live?analyze=${encodeURIComponent(sym)}&gexOnly=1`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data?.gexRow) return;
+
+      const parsedEntry = parseDbGexRow(data.gexRow);
+      const latestLiveP = liveQuotesRef.current[sym]?.price;
+      const syncedEntry = latestLiveP ? recalcGexEntryWithLiveSpot(parsedEntry, latestLiveP) : parsedEntry;
+
+      setGexMap(prev => ({ ...prev, [sym]: syncedEntry }));
+      if (Array.isArray(data.gexRow.unusual_flows)) {
+        setUnusualFlows(prev => [
+          ...data.gexRow.unusual_flows,
+          ...prev.filter(f => f.ticker !== sym)
+        ]);
+      }
+
+      if (apiKey) {
+        await supabaseRequest('/rest/v1/options_gex?on_conflict=symbol', apiKey, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates' },
+          body: JSON.stringify([data.gexRow])
+        });
+      }
+    } catch (e) {
+      console.error('Active GEX chain refresh error:', e);
+    } finally {
+      setIsRecalcingChain(false);
+    }
+  }, [apiKey]);
+
   const fetchAllSupabaseData = useCallback(async (overrideKey) => {
     const activeKey = (overrideKey !== undefined ? overrideKey : apiKey).trim();
     if (!activeKey) return;
@@ -230,6 +390,7 @@ export default function App() {
 
     try {
       let connected = false;
+      const curQuotes = liveQuotesRef.current;
 
       const rMarket = await supabaseRequest('/rest/v1/market_signals?select=*', activeKey);
       if (rMarket.ok) {
@@ -237,16 +398,19 @@ export default function App() {
         const mRows = await rMarket.json();
         if (Array.isArray(mRows) && mRows.length > 0) {
           const mapped = mRows
-            .map(r => ({
-              symbol: r.symbol,
-              name: r.name,
-              price: Number(r.price),
-              change: Number(r.change_pct),
-              dailySignal: r.daily_signal || '震盪整理',
-              h4Signal: r.h4_signal || '4H區間盤整',
-              obos: Number(r.obos_score || 0),
-              obosText: r.obos_level || '中性區間'
-            }))
+            .map(r => {
+              const liveQ = curQuotes[r.symbol];
+              return {
+                symbol: r.symbol,
+                name: r.name,
+                price: liveQ ? liveQ.price : Number(r.price),
+                change: liveQ ? liveQ.change : Number(r.change_pct),
+                dailySignal: r.daily_signal || '震盪整理',
+                h4Signal: r.h4_signal || '4H區間盤整',
+                obos: Number(r.obos_score || 0),
+                obosText: r.obos_level || '中性區間'
+              };
+            })
             .sort((a, b) => {
               const ia = CORE_SYMBOLS.indexOf(a.symbol);
               const ib = CORE_SYMBOLS.indexOf(b.symbol);
@@ -267,36 +431,10 @@ export default function App() {
           const newGexMap = {};
           const allFlows = [];
           gRows.forEach(r => {
-            const baseSpot = Number(r.spot_price);
-            const baseNetGex = Number(r.net_gex);
-            const rawStrikes = Array.isArray(r.strikes_data) && r.strikes_data.length > 0
-              ? r.strikes_data
-              : [
-                  { strike: Number(r.put_wall), callGex: 0.05, putGex: -0.5 },
-                  { strike: Number(r.gamma_flip), callGex: 0.2, putGex: -0.2 },
-                  { strike: Number(r.call_wall), callGex: 0.6, putGex: -0.05 },
-                ];
-            const strikes = rawStrikes.map(st => ({
-              ...st,
-              callGex: Number(st.callGex || 0),
-              putGex: Number(st.putGex || 0),
-              baseCallGex: Number(st.callGex || 0),
-              basePutGex: Number(st.putGex || 0)
-            }));
-            const baseSliceSum = strikes.reduce((acc, s) => acc + s.baseCallGex + s.basePutGex, 0);
-
-            newGexMap[r.symbol] = {
-              spot: baseSpot,
-              baseSpot,
-              callWall: Number(r.call_wall),
-              putWall: Number(r.put_wall),
-              gammaFlip: Number(r.gamma_flip),
-              netGex: baseNetGex,
-              baseNetGex,
-              baseSliceSum,
-              exp: rawStrikes[0]?.exp || '',
-              strikes
-            };
+            const baseEntry = parseDbGexRow(r);
+            const liveSpot = curQuotes[r.symbol]?.price;
+            // 同步雲端時立即套用最新 5s 即時價重算，防止每 30 秒閃回舊快照價
+            newGexMap[r.symbol] = liveSpot ? recalcGexEntryWithLiveSpot(baseEntry, liveSpot) : baseEntry;
             if (Array.isArray(r.unusual_flows)) allFlows.push(...r.unusual_flows);
           });
           setGexMap(newGexMap);
@@ -354,7 +492,7 @@ export default function App() {
     }
   }, [apiKey, handleMineLiveIntel]);
 
-  // 每 5 秒以無漂移初始基準 + 精確 Black-Scholes Gamma 比例重算，保留全鏈 Net GEX 完整性
+  // 每 5 秒拉取最新現價，透過 25 點全鏈精確曲線與 BSM-Forward 即時重算 GEX
   const fetchLive5sTick = useCallback(async () => {
     try {
       const symParam = watchedSymbolsRef.current.join(',');
@@ -363,7 +501,8 @@ export default function App() {
       const { quotes } = await r.json();
       if (!quotes) return;
 
-      setLiveQuotes(quotes);
+      liveQuotesRef.current = { ...liveQuotesRef.current, ...quotes };
+      setLiveQuotes(prev => ({ ...prev, ...quotes }));
 
       setMarketData(prev =>
         prev.map(item =>
@@ -377,35 +516,8 @@ export default function App() {
         const nextMap = { ...prevMap };
         Object.keys(nextMap).forEach(sym => {
           const liveSpot = quotes[sym]?.price;
-          const entry = nextMap[sym];
-          const s0 = entry?.baseSpot;
-          if (liveSpot && s0 && s0 > 0) {
-            const s2Ratio = Math.pow(liveSpot / s0, 2);
-            const updatedStrikes = (entry.strikes || []).map(st => {
-              const T = Number(st.T || 0.0025);
-              const cIv = Number(st.callIv || 0.22);
-              const pIv = Number(st.putIv || 0.22);
-
-              const gCall0 = bsGammaJs(s0, st.strike, T, 0.043, cIv);
-              const gCall1 = bsGammaJs(liveSpot, st.strike, T, 0.043, cIv);
-              const callRatio = gCall0 > 1e-10 ? Math.min(Math.max((gCall1 / gCall0) * s2Ratio, 0), 4.0) : s2Ratio;
-
-              const gPut0 = bsGammaJs(s0, st.strike, T, 0.043, pIv);
-              const gPut1 = bsGammaJs(liveSpot, st.strike, T, 0.043, pIv);
-              const putRatio = gPut0 > 1e-10 ? Math.min(Math.max((gPut1 / gPut0) * s2Ratio, 0), 4.0) : s2Ratio;
-
-              return {
-                ...st,
-                callGex: Number(((st.baseCallGex ?? st.callGex) * callRatio).toFixed(5)),
-                putGex: Number(((st.basePutGex ?? st.putGex) * putRatio).toFixed(5))
-              };
-            });
-
-            const newSliceSum = updatedStrikes.reduce((acc, s) => acc + s.callGex + s.putGex, 0);
-            const deltaSlice = newSliceSum - (entry.baseSliceSum ?? newSliceSum);
-            const updatedNetGex = Number(((entry.baseNetGex ?? entry.netGex) + deltaSlice).toFixed(4));
-
-            nextMap[sym] = { ...entry, spot: liveSpot, netGex: updatedNetGex, strikes: updatedStrikes };
+          if (liveSpot && nextMap[sym]) {
+            nextMap[sym] = recalcGexEntryWithLiveSpot(nextMap[sym], liveSpot);
           }
         });
         return nextMap;
@@ -421,13 +533,23 @@ export default function App() {
   useEffect(() => {
     fetchAllSupabaseData();
     fetchLive5sTick();
+    refreshActiveGexChain('SPX');
+
     const fastTimer = setInterval(fetchLive5sTick, 5000);
     const dbTimer = setInterval(() => fetchAllSupabaseData(), 30000);
+    // 網頁在前景時，每 60 秒對當前觀看的期權標的進行一次 CBOE 全鏈校準 (更新 T、IV 與異常大單)
+    const chainTimer = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        refreshActiveGexChain();
+      }
+    }, 60000);
+
     return () => {
       clearInterval(fastTimer);
       clearInterval(dbTimer);
+      clearInterval(chainTimer);
     };
-  }, [fetchAllSupabaseData, fetchLive5sTick]);
+  }, [fetchAllSupabaseData, fetchLive5sTick, refreshActiveGexChain]);
 
   const resolveCombatSignal = (item) => {
     const pos = positions.find(p => p.ticker === item.symbol);
@@ -570,6 +692,14 @@ export default function App() {
     await supabaseRequest(`/rest/v1/options_gex?symbol=eq.${encodeURIComponent(sym)}`, apiKey, { method: 'DELETE' });
   };
 
+  const handleSelectGexTab = (tk) => {
+    setSelectedGexTicker(tk);
+    // 若該標的在資料庫中尚未升級為含 25 點曲線之新版結構，切換時立即自動重算全鏈
+    if (!gexMap[tk]?.curve?.length) {
+      refreshActiveGexChain(tk);
+    }
+  };
+
   const handlePinNote = async (e) => {
     e.preventDefault();
     if (!noteInput.trim()) return;
@@ -683,6 +813,8 @@ export default function App() {
     const us10y = marketData.find(m => m.symbol === 'US10Y');
     const spxGex = gexMap.SPX || Object.values(gexMap)[0];
     const expNote = spxGex?.exp ? ` [${spxGex.exp}]` : '';
+    const flipLabelEn = spxGex?.gammaFlip > 0 ? `$${spxGex.gammaFlip}` : 'Single-Regime';
+    const flipLabelZh = spxGex?.gammaFlip > 0 ? `$${spxGex.gammaFlip}` : '全區同號';
 
     const triggered = marketData
       .map(m => ({ sym: m.symbol, sig: resolveCombatSignal(m) }))
@@ -695,7 +827,7 @@ export default function App() {
       const trigStr = triggered.length
         ? `Active Signals: ${triggered.map(t => `${t.sym} ${translateSignal(t.sig, 'en')}`).join(' | ')}.`
         : 'No extreme reversal triggers yet; wait for EMA5 confirmation or trade around Call/Put Walls.';
-      return `Next-Session Playbook${expNote}: SPX at ${spx?.price ?? '--'} (${spx?.change >= 0 ? '+' : ''}${spx?.change ?? 0}%), VIX ${vix?.price ?? '--'}, US10Y ${us10y?.price ?? '--'}%. Options regime is in ${gammaMode}. Key SPX pivots: Put Wall $${spxGex?.putWall ?? '--'} | Gamma Flip $${spxGex?.gammaFlip ?? '--'} | Call Wall $${spxGex?.callWall ?? '--'}. ${trigStr}`;
+      return `Next-Session Playbook${expNote}: SPX at ${spx?.price ?? '--'} (${spx?.change >= 0 ? '+' : ''}${spx?.change ?? 0}%), VIX ${vix?.price ?? '--'}, US10Y ${us10y?.price ?? '--'}%. Options regime is in ${gammaMode}. Key SPX pivots: Put Wall $${spxGex?.putWall ?? '--'} | Gamma Flip ${flipLabelEn} | Call Wall $${spxGex?.callWall ?? '--'}. ${trigStr}`;
     }
 
     const gammaModeZh = (spxGex?.netGex ?? 0) >= 0
@@ -704,7 +836,7 @@ export default function App() {
     const trigStrZh = triggered.length
       ? `當前實戰觸發：${triggered.map(t => `${t.sym} ${t.sig}`).join(' ｜ ')}。`
       : '目前自選池尚無極值反轉觸發，日內建議圍繞下一場次 Call/Put Wall 與 Gamma Flip 分界操作。';
-    return `【下一場次盤勢與期權劇本${expNote}】大盤現況：SPX 報 ${spx?.price ?? '--'} (${spx?.change >= 0 ? '+' : ''}${spx?.change ?? 0}%)、VIX 波動率 ${vix?.price ?? '--'}、10Y 美債 ${us10y?.price ?? '--'}%。單場次期權處於${gammaModeZh}，SPX 防守支撐 Put Wall $${spxGex?.putWall ?? '--'}、精確多空翻轉點 Gamma Flip $${spxGex?.gammaFlip ?? '--'}、上檔阻力 Call Wall $${spxGex?.callWall ?? '--'}。${trigStrZh}`;
+    return `【下一場次盤勢與期權劇本${expNote}】大盤現況：SPX 報 ${spx?.price ?? '--'} (${spx?.change >= 0 ? '+' : ''}${spx?.change ?? 0}%)、VIX 波動率 ${vix?.price ?? '--'}、10Y 美債 ${us10y?.price ?? '--'}%。單場次期權處於${gammaModeZh}，SPX 防守支撐 Put Wall $${spxGex?.putWall ?? '--'}、精確多空翻轉點 Gamma Flip ${flipLabelZh}、上檔阻力 Call Wall $${spxGex?.callWall ?? '--'}。${trigStrZh}`;
   };
 
   const flowIntelCards = unusualFlows.slice(0, 2).map((f, idx) => ({
@@ -768,7 +900,7 @@ export default function App() {
                   {isEn ? 'Mac Quant Terminal' : 'Mac金融終端'}
                 </h1>
                 <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                  OBOS v2.1 · Next-Session GEX
+                  OBOS v2.1 · BSM-Forward GEX
                 </span>
                 <button
                   onClick={() => setShowKeyBox(!showKeyBox)}
@@ -784,8 +916,8 @@ export default function App() {
               </div>
               <p className="text-xs text-slate-400">
                 {isEn
-                  ? 'EMA200 3-Tier Regime · 6-Color Signals · Single Next-Session BSM GEX · Actionable Intel'
-                  : 'EMA200 三級政權 · 六色閉環信號 · 下一交易場次精準 GEX · 實戰交易情報挖掘'}
+                  ? 'EMA200 3-Tier Regime · 6-Color Signals · 60s Full-Chain + 5s Curve GEX · Actionable Intel'
+                  : 'EMA200 三級政權 · 六色閉環信號 · 60秒全鏈校準 + 5秒曲線無損 GEX · 實戰交易情報'}
               </p>
             </div>
           </div>
@@ -819,10 +951,14 @@ export default function App() {
             </div>
 
             <button
-              onClick={() => { fetchAllSupabaseData(); fetchLive5sTick(); }}
+              onClick={() => {
+                fetchAllSupabaseData();
+                fetchLive5sTick();
+                refreshActiveGexChain();
+              }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 text-xs font-medium transition"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${(isRefreshing || isRecalcingChain) ? 'animate-spin' : ''}`} />
               {isEn ? 'Sync Cloud' : '立即同步雲端'}
             </button>
           </div>
@@ -999,6 +1135,17 @@ export default function App() {
                   {isEn ? `Session Exp: ${currentGex.exp}` : `鎖定場次到期日: ${currentGex.exp}`}
                 </span>
               )}
+              <button
+                type="button"
+                onClick={() => refreshActiveGexChain(selectedGexTicker)}
+                disabled={isRecalcingChain}
+                className="text-[11px] px-2.5 py-0.5 rounded-md bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 flex items-center gap-1 transition disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${isRecalcingChain ? 'animate-spin' : ''}`} />
+                {isRecalcingChain
+                  ? (isEn ? 'Calibrating Chain...' : '全鏈校準中...')
+                  : (isEn ? 'Recalc Full Chain' : '重算本場全鏈')}
+              </button>
             </div>
 
             <form onSubmit={handleAddGexTicker} className="flex items-center gap-2 w-full sm:w-auto">
@@ -1029,7 +1176,7 @@ export default function App() {
               return (
                 <div
                   key={tk}
-                  onClick={() => setSelectedGexTicker(tk)}
+                  onClick={() => handleSelectGexTab(tk)}
                   className={`flex items-center gap-1 pl-3 pr-1.5 py-1 rounded-lg text-xs font-mono font-bold cursor-pointer transition ${
                     isSelected
                       ? 'bg-emerald-500 text-slate-950 shadow'
@@ -1073,7 +1220,11 @@ export default function App() {
             </div>
             <div className="bg-[#0f172a] border border-amber-500/30 rounded-xl p-3.5">
               <span className="text-xs text-amber-400">{isEn ? 'Gamma Flip (Zero-Gamma Root)' : 'Gamma Flip (零Gamma翻轉點)'}</span>
-              <p className="text-xl font-bold font-mono text-amber-300 mt-1">${currentGex.gammaFlip}</p>
+              <p className="text-xl font-bold font-mono text-amber-300 mt-1">
+                {currentGex.gammaFlip > 0
+                  ? `$${currentGex.gammaFlip}`
+                  : (currentGex.netGex >= 0 ? (isEn ? 'All +GEX' : '全區正Gamma') : (isEn ? 'All -GEX' : '全區負Gamma'))}
+              </p>
             </div>
             <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-3.5">
               <span className="text-xs text-slate-400">{isEn ? 'Session Net GEX (per 1%)' : '本場 Net GEX (每1%波動)'}</span>
